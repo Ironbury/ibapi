@@ -1,6 +1,7 @@
 package ibapi
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -135,6 +136,37 @@ func (c *Connection) connect(host string, port int) error {
 
 	// Atomically update connection state (close previous socket if necessary)
 	if oldConn := c.setConn(newConn); oldConn != nil {
+		_ = oldConn.Close()
+	}
+	atomic.StoreInt32(&c.isConnected, 1)
+
+	log.Debug().Any("address", newConn.RemoteAddr()).Msg("tcp socket connected")
+	return nil
+}
+
+// connectCtx is connect under a context: cancellation or deadline expiry
+// aborts the dial itself (net.Dialer.DialContext), so a dial against a
+// black-holed endpoint cannot outlive the caller's deadline.
+func (c *Connection) connectCtx(ctx context.Context, host string, port int) error {
+	// Protect host/port assignment with mutex to prevent races
+	c.mu.Lock()
+	c.host = host
+	c.port = port
+	c.mu.Unlock()
+
+	c.reset()
+
+	address := fmt.Sprintf("%v:%v", host, port)
+	var d net.Dialer
+	newConn, err := d.DialContext(ctx, "tcp4", address)
+	if err != nil {
+		log.Error().Err(err).Str("host", address).Msg("failed to dial tcp")
+		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), FAIL_CREATE_SOCK.Code, FAIL_CREATE_SOCK.Msg, "")
+		return err
+	}
+
+	// Atomically update connection state (close previous socket if necessary)
+	if oldConn := c.setConn(newConn.(*net.TCPConn)); oldConn != nil {
 		_ = oldConn.Close()
 	}
 	atomic.StoreInt32(&c.isConnected, 1)

@@ -593,6 +593,164 @@ func (c *EClient) Connect(host string, port int, clientID int64) error {
 	return nil
 }
 
+// ConnectWithContext is Connect under a context. The dial honours ctx via
+// net.Dialer.DialContext, and once the socket exists, ctx cancellation or
+// deadline expiry closes it — unblocking any handshake I/O (the header
+// write, its flush, or the first scan against an endpoint that accepted TCP
+// but never answers) — so the call always returns promptly. Every failure
+// path closes the socket and resets the client so an abandoned attempt
+// leaks neither the socket, state, nor a goroutine; when ctx is done the
+// ctx error is returned. Connect's own contract is otherwise unchanged.
+func (c *EClient) ConnectWithContext(ctx context.Context, host string, port int, clientID int64) error {
+
+	if c.IsConnected() {
+		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), ALREADY_CONNECTED.Code, ALREADY_CONNECTED.Msg, "")
+		return ALREADY_CONNECTED
+	}
+
+	if err := c.validateInvalidSymbols(host); err != nil {
+		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), INVALID_SYMBOL.Code, INVALID_SYMBOL.Msg+err.Error(), "")
+		return err
+	}
+
+	c.host = host
+	c.port = port
+	c.clientID = clientID
+
+	c.setConnState(CONNECTING)
+
+	// Connecting to IB server
+	log.Info().Str("host", host).Int("port", port).Int64("clientID", clientID).Msg("Connecting to IB server")
+	if err := c.conn.connectCtx(ctx, c.host, c.port); err != nil {
+		log.Error().Err(CONNECT_FAIL).Msg("Connection fail")
+		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), CONNECT_FAIL.Code, CONNECT_FAIL.Msg, "")
+		c.reset()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return CONNECT_FAIL
+	}
+
+	// The socket exists from here: cancellation must close it so blocked
+	// handshake I/O returns, and every error return must close it rather
+	// than leak it. conn is captured (not re-read from c) because fail()'s
+	// reset() replaces c.conn with a fresh Connection.
+	conn := c.conn
+	stop := context.AfterFunc(ctx, func() { _ = conn.disconnect() })
+	fail := func(err error) error {
+		stop()
+		_ = conn.disconnect()
+		c.reset()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err == nil {
+			// a clean EOF mid-handshake leaves scanner.Err() nil
+			return CONNECT_FAIL
+		}
+		return err
+	}
+
+	// HandShake with the TWS or GateWay to ensure the version,
+	log.Debug().Msg("Handshake with TWS or GateWay")
+
+	head := []byte("API\x00")
+
+	connectOptions := ""
+	if c.connectOptions != "" {
+		connectOptions = " " + c.connectOptions
+	}
+	sizeofCV := make([]byte, 4)
+	clientVersion := fmt.Appendf(nil, "v%d..%d%s", MIN_CLIENT_VER, MAX_CLIENT_VER, connectOptions)
+
+	binary.BigEndian.PutUint32(sizeofCV, uint32(len(clientVersion)))
+
+	var msg bytes.Buffer
+	msg.Write(head)
+	msg.Write(sizeofCV)
+	msg.Write(clientVersion)
+
+	log.Debug().Bytes("header", msg.Bytes()).Msg("Sending handshake header")
+
+	if _, err := c.writer.Write(msg.Bytes()); err != nil {
+		return fail(err)
+	}
+
+	if err := c.writer.Flush(); err != nil {
+		return fail(err)
+	}
+
+	log.Debug().Msg("Receiving handshake Info")
+
+	// scan once to get server info
+	if !c.scanner.Scan() {
+		return fail(c.scanner.Err())
+	}
+
+	// Init server info
+	msgBytes := c.scanner.Bytes()
+	serverInfo := splitMsgBytes(msgBytes)
+	v, _ := strconv.Atoi(string(serverInfo[0]))
+	c.serverVersion = Version(v)
+	if c.serverVersion < MIN_SERVER_VER_SUPPORTED {
+		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), UNSUPPORTED_VERSION.Code, UNSUPPORTED_VERSION.Msg, "")
+		return fail(UNSUPPORTED_VERSION)
+	}
+
+	c.connTime = string(serverInfo[1])
+	log.Info().Int("serverVersion", v).Str("connectionTime", c.connTime).Msg("Handshake completed")
+
+	// init decoder
+	c.decoder = &EDecoder{wrapper: c.wrapper, serverVersion: c.serverVersion}
+
+	//start Ereader
+	go EReader(c.ctx, c.cancel, c.scanner, c.decoder, &c.wg)
+
+	// start requester
+	go c.request()
+
+	// startAPI
+	if err := c.startAPI(); err != nil {
+		// reader and requester are running: cancel them and close the
+		// socket (no reset — the client is spent, like Connect's own
+		// post-goroutine failures; callers build a fresh EClient).
+		stop()
+		c.cancel()
+		_ = conn.disconnect()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+
+	c.setConnState(CONNECTED)
+	c.wrapper.ConnectAck()
+
+	// Launch the shutdown watcher exactly once
+	c.watchOnce.Do(func() {
+		go func() {
+			<-c.ctx.Done() // waits for c.cancel()
+			if err := c.Disconnect(); err != nil {
+				log.Error().Err(err).Msg("Disconnect error in watcher")
+			}
+		}()
+	})
+
+	if !stop() {
+		// ctx fired between handshake completion and here: the socket is
+		// closed or closing. Tear down fully rather than reporting a
+		// half-dead success.
+		if err := c.Disconnect(); err != nil {
+			log.Error().Err(err).Msg("Disconnect error unwinding a cancelled connect")
+		}
+		return ctx.Err()
+	}
+
+	log.Debug().Msg("IB Client Connected!")
+
+	return nil
+}
+
 // ConnectWithGracefulShutdown connects and sets up signal handling for graceful shutdown.
 // This is a convenience for simple apps. Advanced users should handle signals themselves.
 func (c *EClient) ConnectWithGracefulShutdown(host string, port int, clientID int64) error {
