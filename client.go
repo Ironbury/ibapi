@@ -329,6 +329,9 @@ func (c *EClient) reset() {
 
 	c.reqChan = make(chan []byte, 10)
 
+	if c.cancel != nil {
+		c.cancel() // release anyone still waiting on the abandoned session
+	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
 	c.wg = sync.WaitGroup{}
@@ -353,10 +356,11 @@ func (c *EClient) setConnState(state ConnState) {
 
 // enqueue hands a request to the requester. The queue is small, so this
 // waits while it is full; once the session ends (its context is cancelled
-// by Disconnect, a read or write error, or a failed start) the requester
-// reads no more, and the request is dropped with the NOT_CONNECTED error a
-// request on a closed connection gets, rather than blocking for ever.
-// Disconnect leaves reqChan and ctx in place, so they are the session's own.
+// by Disconnect, a read or write error, or ConnectWithContext giving up)
+// the requester reads no more, and the request is dropped with the
+// NOT_CONNECTED error a request on a closed connection gets, rather than
+// blocking for ever. Disconnect leaves reqChan and ctx in place, so they
+// are the session's own.
 func (c *EClient) enqueue(id int64, req []byte) {
 	if c.ctx.Err() == nil { // an ended session takes nothing, even with room
 		select {
@@ -662,10 +666,14 @@ func (c *EClient) ConnectWithContext(ctx context.Context, host string, port int,
 
 	// The socket exists from here: cancellation must close it so blocked
 	// handshake I/O returns, and every error return must close it rather
-	// than leak it. conn is captured (not re-read from c) because fail()'s
-	// reset() replaces c.conn with a fresh Connection.
-	conn := c.conn
-	stop := context.AfterFunc(ctx, func() { _ = conn.disconnect() })
+	// than leak it. Cancellation also ends the session, so a reader or
+	// requester already started stops. conn and the session's cancel are
+	// captured (not re-read from c) because fail()'s reset() replaces them.
+	conn, endSession := c.conn, c.cancel
+	stop := context.AfterFunc(ctx, func() {
+		endSession()
+		_ = conn.disconnect()
+	})
 	fail := func(err error) error {
 		stop()
 		_ = conn.disconnect()

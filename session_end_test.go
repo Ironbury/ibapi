@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,23 @@ func (w *sessionWrapper) waitClosed(t *testing.T, why string) {
 	case <-time.After(3 * time.Second):
 		t.Fatal(why)
 	}
+}
+
+// waitBlocked waits until a goroutine is blocked on a channel inside fn
+// (a function's qualified name, such as "ibapi.(*EClient).CancelMktData").
+func waitBlocked(t *testing.T, fn string) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		n := runtime.Stack(buf, true)
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			blocked := strings.Contains(g, " [chan send") || strings.Contains(g, " [select")
+			if blocked && strings.Contains(g, fn+"(") {
+				return
+			}
+		}
+	}
+	t.Fatalf("no goroutine blocked on a channel in %s", fn)
 }
 
 // fakeTWS answers the API handshake as server version 100 (text messages),
@@ -180,13 +198,8 @@ func TestARequestWaitingForRoomInTheQueueIsReleasedWhenTheSessionEnds(t *testing
 		defer close(order)
 		c.CancelOrder(88, NewOrderCancel())
 	}()
-	select {
-	case <-mktData:
-		t.Fatal("a request went into a full queue")
-	case <-order:
-		t.Fatal("a request went into a full queue")
-	case <-time.After(100 * time.Millisecond):
-	}
+	waitBlocked(t, "ibapi.(*EClient).CancelMktData")
+	waitBlocked(t, "ibapi.(*EClient).CancelOrder")
 
 	if err := c.Disconnect(); err != nil {
 		t.Fatal(err)
@@ -228,49 +241,30 @@ func TestARequestAfterTheSessionEndedIsRefusedEvenWithRoomInTheQueue(t *testing.
 	}
 }
 
-// stallWrapper holds the decoder in its first CurrentTime callback until
-// release is closed.
-type stallWrapper struct {
-	Wrapper
-	entered, release chan struct{}
-	once             sync.Once
-}
-
-func (w *stallWrapper) CurrentTime(int64) {
-	w.once.Do(func() {
-		close(w.entered)
-		<-w.release
-	})
-}
-
 // When the session ends while the decoder's queue is full, the reader
-// stops instead of waiting for ever to hand the decoder a message, so a
-// Disconnect waiting for it returns.
+// stops instead of waiting for ever to hand over its next message (the
+// decoder has stopped reading), so a Disconnect waiting for it returns.
 func TestTheReaderStopsWhenTheSessionEndsWithTheDecodersQueueFull(t *testing.T) {
 	var msgs bytes.Buffer
-	for range 400 { // one in the decoder, 300 queued, the rest waiting
+	for range 3 {
 		msgs.Write(frame("49\x001\x001700000000\x00"))
 	}
 	scanner := bufio.NewScanner(&msgs)
 	scanner.Split(scanFields)
-	w := &stallWrapper{entered: make(chan struct{}), release: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	EReader(ctx, cancel, scanner, &EDecoder{wrapper: w, serverVersion: 100}, &wg)
-	<-w.entered
-	time.Sleep(100 * time.Millisecond) // the reader fills the decoder's queue
+	msgChan := make(chan []byte, 1) // nothing reads it: the first message fills it
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		readMessages(ctx, cancel, scanner, msgChan)
+	}()
+	waitBlocked(t, "ibapi.readMessages") // holding the second message
 
 	cancel()
-	close(w.release)
-	stopped := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(stopped)
-	}()
 	select {
-	case <-stopped:
+	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("the reader still waits to hand the decoder a message after the session ended")
+		t.Fatal("the reader still waits to hand over a message after the session ended")
 	}
 }
 
@@ -366,5 +360,19 @@ func TestAClientWhoseSessionEndedDoesNotConnectAgain(t *testing.T) {
 	}
 	if n := s.accepts.Load(); n != 1 {
 		t.Fatalf("%d connections, want 1", n)
+	}
+}
+
+// A failed connect's reset ends the abandoned session's context, so
+// nothing waiting on it waits for ever.
+func TestAResetEndsTheAbandonedSession(t *testing.T) {
+	c := NewEClient(newSessionWrapper())
+	abandoned := c.Ctx()
+	c.reset()
+	if abandoned.Err() == nil {
+		t.Fatal("the abandoned session's context is still live")
+	}
+	if c.Ctx().Err() != nil {
+		t.Fatal("the fresh session's context is already ended")
 	}
 }

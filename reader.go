@@ -45,47 +45,43 @@ func EReader(ctx context.Context, cancel context.CancelFunc, scanner *bufio.Scan
 		defer wg.Done()
 		defer close(msgChan) // close the channel so decoder exits
 
-		// for scanner.Scan() {
-		// 	msgBytes := make([]byte, len(scanner.Bytes()))
-		// 	copy(msgBytes, scanner.Bytes())
-		// 	msgChan <- msgBytes
-		// 	if err := scanner.Err(); err != nil {
-		// 		log.Error().Err(err).Msg("scanner error")
-		// 		break
-		// 	}
-		// }
+		readMessages(ctx, cancel, scanner, msgChan)
+	}()
+}
 
-		for {
-			select {
-			case <-ctx.Done():
-				// shutdown in flight
-				return
-			default:
-				// block here until there's a token or an error/EOF
-				if !scanner.Scan() {
-					// only take action if we weren't already cancelled
-					if ctx.Err() == nil {
-						if err := scanner.Err(); err != nil {
-							log.Error().Err(err).Msg("scanner error, triggering shutdown")
-						} else {
-							log.Debug().Msg("scanner reached EOF, triggering shutdown")
-						}
-						cancel()
+// readMessages scans messages and queues them for the decoder until the
+// input ends or fails (it then cancels the session) or the session ends.
+func readMessages(ctx context.Context, cancel context.CancelFunc, scanner *bufio.Scanner, msgChan chan<- []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			// shutdown in flight
+			return
+		default:
+			// block here until there's a token or an error/EOF
+			if !scanner.Scan() {
+				// only take action if we weren't already cancelled
+				if ctx.Err() == nil {
+					if err := scanner.Err(); err != nil {
+						log.Error().Err(err).Msg("scanner error, triggering shutdown")
+					} else {
+						log.Debug().Msg("scanner reached EOF, triggering shutdown")
 					}
-					return
+					cancel()
 				}
+				return
+			}
 
-				// successful scan → queue for decode, unless the session
-				// ends first: the decoder then reads no more, and a send
-				// into a full queue would keep this goroutine, and so
-				// Disconnect's wait, blocked for ever
-				msgBytes := slices.Clone(scanner.Bytes())
-				select {
-				case msgChan <- msgBytes:
-				case <-ctx.Done():
-					return
-				}
+			// successful scan → queue for decode, unless the session
+			// ends first: the decoder then reads no more, and a send
+			// into a full queue would keep this goroutine, and so
+			// Disconnect's wait, blocked for ever
+			msgBytes := slices.Clone(scanner.Bytes())
+			select {
+			case msgChan <- msgBytes:
+			case <-ctx.Done():
+				return
 			}
 		}
-	}()
+	}
 }
