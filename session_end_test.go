@@ -62,21 +62,28 @@ func (w *sessionWrapper) waitClosed(t *testing.T, why string) {
 	}
 }
 
-// waitBlocked waits until a goroutine is blocked on a channel inside fn
+// goid is the calling goroutine's id, as stack dumps name it
+// ("goroutine 7 [running]:").
+func goid() string {
+	buf := make([]byte, 64)
+	return strings.Fields(string(buf[:runtime.Stack(buf, false)]))[1]
+}
+
+// waitBlocked waits until goroutine id is blocked on a channel inside fn
 // (a function's qualified name, such as "ibapi.(*EClient).CancelMktData").
-func waitBlocked(t *testing.T, fn string) {
+func waitBlocked(t *testing.T, id, fn string) {
 	t.Helper()
 	buf := make([]byte, 1<<20)
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
 		n := runtime.Stack(buf, true)
 		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
-			blocked := strings.Contains(g, " [chan send") || strings.Contains(g, " [select")
+			blocked := strings.HasPrefix(g, "goroutine "+id+" [chan send") || strings.HasPrefix(g, "goroutine "+id+" [select")
 			if blocked && strings.Contains(g, fn+"(") {
 				return
 			}
 		}
 	}
-	t.Fatalf("no goroutine blocked on a channel in %s", fn)
+	t.Fatalf("goroutine %s is not blocked on a channel in %s", id, fn)
 }
 
 // fakeTWS answers the API handshake as server version 100 (text messages),
@@ -190,16 +197,19 @@ func TestARequestWaitingForRoomInTheQueueIsReleasedWhenTheSessionEnds(t *testing
 		c.ReqCurrentTime()
 	}
 	mktData, order := make(chan struct{}), make(chan struct{})
+	mktDataID, orderID := make(chan string, 1), make(chan string, 1)
 	go func() {
 		defer close(mktData)
+		mktDataID <- goid()
 		c.CancelMktData(77)
 	}()
 	go func() {
 		defer close(order)
+		orderID <- goid()
 		c.CancelOrder(88, NewOrderCancel())
 	}()
-	waitBlocked(t, "ibapi.(*EClient).CancelMktData")
-	waitBlocked(t, "ibapi.(*EClient).CancelOrder")
+	waitBlocked(t, <-mktDataID, "ibapi.(*EClient).CancelMktData")
+	waitBlocked(t, <-orderID, "ibapi.(*EClient).CancelOrder")
 
 	if err := c.Disconnect(); err != nil {
 		t.Fatal(err)
@@ -253,12 +263,13 @@ func TestTheReaderStopsWhenTheSessionEndsWithTheDecodersQueueFull(t *testing.T) 
 	scanner.Split(scanFields)
 	ctx, cancel := context.WithCancel(context.Background())
 	msgChan := make(chan []byte, 1) // nothing reads it: the first message fills it
-	done := make(chan struct{})
+	done, id := make(chan struct{}), make(chan string, 1)
 	go func() {
 		defer close(done)
+		id <- goid()
 		readMessages(ctx, cancel, scanner, msgChan)
 	}()
-	waitBlocked(t, "ibapi.readMessages") // holding the second message
+	waitBlocked(t, <-id, "ibapi.readMessages") // holding the second message
 
 	cancel()
 	select {
