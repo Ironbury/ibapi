@@ -214,8 +214,9 @@ func TestConnectionRaceConditions(t *testing.T) {
 		msgSent, bytesSent, msgRecv, bytesRecv)
 }
 
-// TestConnectionConcurrentReconnect tests the reconnection logic under concurrent access
-func TestConnectionConcurrentReconnect(t *testing.T) {
+// TestConnectionConcurrentConnectWrite tests writes racing connects and
+// disconnects (a failed write is an error; it never redials)
+func TestConnectionConcurrentConnectWrite(t *testing.T) {
 	// Start dummy server
 	server, err := NewDummyServer()
 	if err != nil {
@@ -236,7 +237,7 @@ func TestConnectionConcurrentReconnect(t *testing.T) {
 	var wg sync.WaitGroup
 	numGoroutines := 5
 
-	// Multiple goroutines trying to write (which triggers reconnect on failure)
+	// Multiple goroutines trying to write
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -248,11 +249,11 @@ func TestConnectionConcurrentReconnect(t *testing.T) {
 				return
 			}
 
-			// Try multiple writes - some may trigger reconnection
+			// Try multiple writes - some may fail
 			for j := 0; j < 50; j++ {
 				data := []byte(fmt.Sprintf("Message from goroutine %d, iteration %d", id, j))
 
-				// This can race with other goroutines doing connect/disconnect/reconnect
+				// This can race with other goroutines doing connect/disconnect
 				_, err := conn.Write(data)
 				if err != nil {
 					// Expected during concurrent access
@@ -276,7 +277,7 @@ func TestConnectionConcurrentReconnect(t *testing.T) {
 
 	wg.Wait()
 
-	t.Logf("Concurrent reconnect test completed")
+	t.Logf("Concurrent connect/write test completed")
 }
 
 // TestConnectionStatisticsRace focuses specifically on the statistics counter races

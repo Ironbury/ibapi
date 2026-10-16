@@ -6,12 +6,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
-)
-
-const (
-	maxReconnectAttempts = 3
-	reconnectDelay       = 500 * time.Millisecond
 )
 
 // Connection is a TCPConn wrapper with lock-free statistics and minimal contention.
@@ -29,48 +23,26 @@ type Connection struct {
 	numMsgSent   int64 // atomic
 	numBytesRecv int64 // atomic
 	numMsgRecv   int64 // atomic
-
-	// Reconnection control - prevents multiple concurrent reconnections
-	reconnecting int32 // atomic: 0=not reconnecting, 1=reconnecting
 }
 
+// Write writes to the socket. A write error fails the write, with no
+// redial: a fresh socket has not done the TWS handshake, so TWS would drop
+// what was written to it, and the session is over (the requester ends it).
 func (c *Connection) Write(bs []byte) (int, error) {
-	// Fast path: try write with current connection
 	conn := c.getConn()
-	if conn != nil {
-		n, err := conn.Write(bs)
-		if err == nil {
-			// Lock-free atomic statistics update
-			atomic.AddInt64(&c.numBytesSent, int64(n))
-			atomic.AddInt64(&c.numMsgSent, 1)
-			log.Trace().Int("nBytes", n).Msg("conn write")
-			return n, nil
-		}
-
-		// Write failed, try to reconnect
-		log.Warn().Err(err).Msg("Write error detected, attempting to reconnect...")
-	}
-
-	// Slow path: reconnect and retry
-	if err := c.reconnect(); err != nil {
-		return 0, fmt.Errorf("write failed and reconnection failed: %w", err)
-	}
-
-	// Retry write after reconnection
-	conn = c.getConn()
 	if conn == nil {
-		return 0, fmt.Errorf("connection still not available after reconnect")
+		return 0, fmt.Errorf("connection not available")
 	}
 
 	n, err := conn.Write(bs)
 	if err != nil {
-		return 0, fmt.Errorf("write retry after reconnect failed: %w", err)
+		return n, err
 	}
 
 	// Lock-free atomic statistics update
 	atomic.AddInt64(&c.numBytesSent, int64(n))
 	atomic.AddInt64(&c.numMsgSent, 1)
-	log.Trace().Int("nBytes", n).Msg("conn write (after reconnect)")
+	log.Trace().Int("nBytes", n).Msg("conn write")
 	return n, nil
 }
 
@@ -173,57 +145,6 @@ func (c *Connection) connectCtx(ctx context.Context, host string, port int) erro
 
 	log.Debug().Any("address", newConn.RemoteAddr()).Msg("tcp socket connected")
 	return nil
-}
-
-func (c *Connection) reconnect() error {
-	// Use atomic CAS to prevent multiple concurrent reconnections
-	if !atomic.CompareAndSwapInt32(&c.reconnecting, 0, 1) {
-		// Another goroutine is already reconnecting, wait for it
-		for atomic.LoadInt32(&c.reconnecting) == 1 {
-			time.Sleep(10 * time.Millisecond)
-		}
-		// Check if the other goroutine succeeded
-		if atomic.LoadInt32(&c.isConnected) == 1 {
-			return nil
-		}
-		return fmt.Errorf("concurrent reconnection failed")
-	}
-
-	// Ensure we clear the reconnecting flag when done
-	defer atomic.StoreInt32(&c.reconnecting, 0)
-
-	var err error
-	backoff := reconnectDelay // Start with base delay
-
-	// try up to maxReconnectAttempts times
-	for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
-		log.Info().
-			Int("attempt", attempt).
-			Int("maxAttempts", maxReconnectAttempts).
-			Msg("Attempting to reconnect")
-
-		// Read host/port atomically to avoid race
-		c.mu.RLock()
-		host, port := c.host, c.port
-		c.mu.RUnlock()
-
-		err = c.connect(host, port)
-		if err == nil {
-			log.Info().Msg("Reconnection successful")
-			atomic.StoreInt32(&c.isConnected, 1)
-			return nil
-		}
-
-		// if this isn't our last try, wait and then loop again
-		if attempt < maxReconnectAttempts {
-			time.Sleep(backoff)
-			backoff *= 2
-		}
-	}
-
-	// if we get here, all attempts failed
-	atomic.StoreInt32(&c.isConnected, 0)
-	return fmt.Errorf("failed to reconnect after %d attempts: %w", maxReconnectAttempts, err)
 }
 
 func (c *Connection) disconnect() error {

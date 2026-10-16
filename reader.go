@@ -75,9 +75,16 @@ func EReader(ctx context.Context, cancel context.CancelFunc, scanner *bufio.Scan
 					return
 				}
 
-				// successful scan → queue for decode
+				// successful scan → queue for decode, unless the session
+				// ends first: the decoder then reads no more, and a send
+				// into a full queue would keep this goroutine, and so
+				// Disconnect's wait, blocked for ever
 				msgBytes := slices.Clone(scanner.Bytes())
-				msgChan <- msgBytes
+				select {
+				case msgChan <- msgBytes:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()

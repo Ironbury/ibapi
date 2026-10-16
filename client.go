@@ -340,18 +340,42 @@ func (c *EClient) reset() {
 	c.connectOptions = ""
 }
 
+// ErrSessionEnded is Connect's answer on a client whose session has ended.
+// Disconnect keeps the ended session's state, so callers still using it
+// never race a reset; a new session needs a new EClient.
+var ErrSessionEnded = errors.New("ibapi: this client's session has ended; connect with a new EClient")
+
 func (c *EClient) setConnState(state ConnState) {
 	cs := ConnState(atomic.LoadInt32(&c.connState))
 	atomic.StoreInt32(&c.connState, int32(state))
 	log.Debug().Stringer("from", cs).Stringer("to", state).Msg("connection state changed")
 }
 
+// enqueue hands a request to the requester. The queue is small, so this
+// waits while it is full; once the session ends (its context is cancelled
+// by Disconnect, a read or write error, or a failed start) the requester
+// reads no more, and the request is dropped with the NOT_CONNECTED error a
+// request on a closed connection gets, rather than blocking for ever.
+// Disconnect leaves reqChan and ctx in place, so they are the session's own.
+func (c *EClient) enqueue(id int64, req []byte) {
+	if c.ctx.Err() == nil { // an ended session takes nothing, even with room
+		select {
+		case c.reqChan <- req:
+			return
+		case <-c.ctx.Done():
+		}
+	}
+	c.wrapper.Error(id, currentTimeMillis(), NOT_CONNECTED.Code, NOT_CONNECTED.Msg, "")
+}
+
 // request is a goroutine that will get the req from reqChan and send it to TWS.
+// The caller adds it to c.wg before starting it, so Disconnect's wait
+// always covers it. Every exit cancels the session; the shutdown watcher
+// then disconnects.
 func (c *EClient) request() {
 	log.Debug().Msg("requester started")
 	defer log.Debug().Msg("requester ended")
 
-	c.wg.Add(1)
 	defer c.wg.Done()
 
 	for {
@@ -368,11 +392,8 @@ func (c *EClient) request() {
 			nn, err := c.writer.Write(req)
 			if err != nil {
 				log.Error().Err(err).Int("nbytes", nn).Bytes("reqMsg", req).Msg("requester write error")
-				// Disconnect the client
-				log.Info().Msg("Disconnecting client due to write error.")
-				if disconnectErr := c.Disconnect(); disconnectErr != nil {
-					log.Error().Err(disconnectErr).Msg("Error during disconnect.")
-				}
+				// Not Disconnect here: it waits on c.wg, which this
+				// goroutine is in. The watcher disconnects.
 				c.cancel()
 				return
 			}
@@ -492,6 +513,10 @@ func (c *EClient) Connect(host string, port int, clientID int64) error {
 		return ALREADY_CONNECTED
 	}
 
+	if c.ctx.Err() != nil {
+		return ErrSessionEnded
+	}
+
 	if err := c.validateInvalidSymbols(host); err != nil {
 		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), INVALID_SYMBOL.Code, INVALID_SYMBOL.Msg+err.Error(), "")
 		return err
@@ -564,10 +589,10 @@ func (c *EClient) Connect(host string, port int, clientID int64) error {
 	// init decoder
 	c.decoder = &EDecoder{wrapper: c.wrapper, serverVersion: c.serverVersion}
 
-	//start Ereader
-	go EReader(c.ctx, c.cancel, c.scanner, c.decoder, &c.wg)
-
-	// start requester
+	// start the reader and the requester, each in c.wg before it runs
+	// (EReader starts its goroutines and returns)
+	EReader(c.ctx, c.cancel, c.scanner, c.decoder, &c.wg)
+	c.wg.Add(1)
 	go c.request()
 
 	// startAPI
@@ -606,6 +631,10 @@ func (c *EClient) ConnectWithContext(ctx context.Context, host string, port int,
 	if c.IsConnected() {
 		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), ALREADY_CONNECTED.Code, ALREADY_CONNECTED.Msg, "")
 		return ALREADY_CONNECTED
+	}
+
+	if c.ctx.Err() != nil {
+		return ErrSessionEnded
 	}
 
 	if err := c.validateInvalidSymbols(host); err != nil {
@@ -703,10 +732,10 @@ func (c *EClient) ConnectWithContext(ctx context.Context, host string, port int,
 	// init decoder
 	c.decoder = &EDecoder{wrapper: c.wrapper, serverVersion: c.serverVersion}
 
-	//start Ereader
-	go EReader(c.ctx, c.cancel, c.scanner, c.decoder, &c.wg)
-
-	// start requester
+	// start the reader and the requester, each in c.wg before it runs
+	// (EReader starts its goroutines and returns)
+	EReader(c.ctx, c.cancel, c.scanner, c.decoder, &c.wg)
+	c.wg.Add(1)
 	go c.request()
 
 	// startAPI
@@ -771,6 +800,8 @@ func (c *EClient) ConnectWithGracefulShutdown(host string, port int, clientID in
 
 // Disconnect terminates the connections with TWS.
 // Calling this function does not cancel orders that have already been sent.
+// Requests made after it, or waiting for room in the request queue when it
+// runs, get a NOT_CONNECTED error.
 func (c *EClient) Disconnect() error {
 	if !c.IsConnected() {
 		return nil
@@ -790,8 +821,9 @@ func (c *EClient) Disconnect() error {
 	// 3) Wait for loops to exit
 	c.wg.Wait()
 
-	// 4) Reset internal state
-	c.reset()
+	// No reset: callers may still be using this session, and a reset
+	// would swap its fields under them. They see a closed session; a new
+	// session needs a new EClient (ErrSessionEnded).
 
 	c.wrapper.ConnectionClosed()
 	log.Debug().Msg("IB Client Disconnected!")
@@ -848,7 +880,7 @@ func (c *EClient) ReqCurrentTime() {
 
 	me.encodeMsgID(REQ_CURRENT_TIME).encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqCurrentTimeProtoBuf(currentTimeRequestProto *protobuf.CurrentTimeRequest) {
@@ -870,7 +902,7 @@ func (c *EClient) reqCurrentTimeProtoBuf(currentTimeRequestProto *protobuf.Curre
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ServerVersion returns the version of the TWS instance to which the API application is connected.
@@ -903,7 +935,7 @@ func (c *EClient) SetServerLogLevel(logLevel int64) {
 
 	me.encodeMsgID(SET_SERVER_LOGLEVEL).encodeInt(VERSION).encodeInt64(logLevel)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) setServerLogLevelProtoBuf(SetServerLogLevelRequest *protobuf.SetServerLogLevelRequest) {
@@ -925,7 +957,7 @@ func (c *EClient) setServerLogLevelProtoBuf(SetServerLogLevelRequest *protobuf.S
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ConnectionTime is the time the API application made a connection to TWS.
@@ -1032,7 +1064,7 @@ func (c *EClient) ReqMktData(reqID int64, contract *Contract, genericTickList st
 		me.encodeTagValues(mktDataOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqMarketDataProtoBuf(marketDataRequestProto *protobuf.MarketDataRequest) {
@@ -1059,7 +1091,7 @@ func (c *EClient) reqMarketDataProtoBuf(marketDataRequestProto *protobuf.MarketD
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelMktData stops the market data flow for the specified TickerId.
@@ -1081,7 +1113,7 @@ func (c *EClient) CancelMktData(reqID int64) {
 
 	me.encodeMsgID(CANCEL_MKT_DATA).encodeInt(VERSION).encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelMarketDataProtoBuf(cancelMarketDataProto *protobuf.CancelMarketData) {
@@ -1108,7 +1140,7 @@ func (c *EClient) cancelMarketDataProtoBuf(cancelMarketDataProto *protobuf.Cance
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqMarketDataType changes the market data type.
@@ -1151,7 +1183,7 @@ func (c *EClient) ReqMarketDataType(marketDataType int64) {
 
 	me.encodeMsgID(REQ_MARKET_DATA_TYPE).encodeInt(VERSION).encodeInt64(marketDataType)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqMarketDataTypeProtoBuf(marketDataTypeRequestProto *protobuf.MarketDataTypeRequest) {
@@ -1173,7 +1205,7 @@ func (c *EClient) reqMarketDataTypeProtoBuf(marketDataTypeRequestProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqSmartComponents request the smartComponents.
@@ -1198,7 +1230,7 @@ func (c *EClient) ReqSmartComponents(reqID int64, bboExchange string) {
 
 	me.encodeMsgID(REQ_SMART_COMPONENTS).encodeInt64(reqID).encodeString(bboExchange)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqSmartComponentsProtoBuf(smartComponentsRequestProto *protobuf.SmartComponentsRequest) {
@@ -1225,7 +1257,7 @@ func (c *EClient) reqSmartComponentsProtoBuf(smartComponentsRequestProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqMarketRule requests the market rule.
@@ -1250,7 +1282,7 @@ func (c *EClient) ReqMarketRule(marketRuleID int64) {
 
 	me.encodeMsgID(REQ_MARKET_RULE).encodeInt64(marketRuleID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqMarketRuleProtoBuf(marketRuleRequestProto *protobuf.MarketRuleRequest) {
@@ -1272,7 +1304,7 @@ func (c *EClient) reqMarketRuleProtoBuf(marketRuleRequestProto *protobuf.MarketR
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqTickByTickData request the tick-by-tick data.
@@ -1325,7 +1357,7 @@ func (c *EClient) ReqTickByTickData(reqID int64, contract *Contract, tickType st
 		me.encodeInt64(numberOfTicks).encodeBool(ignoreSize)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqTickByTickDataProtoBuf(tickByTickRequestProto *protobuf.TickByTickRequest) {
@@ -1352,7 +1384,7 @@ func (c *EClient) reqTickByTickDataProtoBuf(tickByTickRequestProto *protobuf.Tic
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelTickByTickData cancel the tick-by-tick data
@@ -1377,7 +1409,7 @@ func (c *EClient) CancelTickByTickData(reqID int64) {
 
 	me.encodeMsgID(CANCEL_TICK_BY_TICK_DATA).encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelTickByTickDataProtoBuf(cancelTickByTickProto *protobuf.CancelTickByTick) {
@@ -1404,7 +1436,7 @@ func (c *EClient) cancelTickByTickDataProtoBuf(cancelTickByTickProto *protobuf.C
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -1467,7 +1499,7 @@ func (c *EClient) CalculateImpliedVolatility(reqID int64, contract *Contract, op
 		me.encodeTagValues(miscOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) calculateImpliedVolatilityProtoBuf(calculateImpliedVolatilityRequestProto *protobuf.CalculateImpliedVolatilityRequest) {
@@ -1494,7 +1526,7 @@ func (c *EClient) calculateImpliedVolatilityProtoBuf(calculateImpliedVolatilityR
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelCalculateImpliedVolatility cancels a request to calculate volatility for a supplied option price and underlying price.
@@ -1524,7 +1556,7 @@ func (c *EClient) CancelCalculateImpliedVolatility(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelCalculateImpliedVolatilityProtoBuf(cancelCalculateImpliedVolatilityProto *protobuf.CancelCalculateImpliedVolatility) {
@@ -1551,7 +1583,7 @@ func (c *EClient) cancelCalculateImpliedVolatilityProtoBuf(cancelCalculateImplie
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CalculateOptionPrice calculate the price of the option
@@ -1611,7 +1643,7 @@ func (c *EClient) CalculateOptionPrice(reqID int64, contract *Contract, volatili
 		me.encodeTagValues(miscOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) calculateOptionPriceProtoBuf(calculateOptionPriceRequestProto *protobuf.CalculateOptionPriceRequest) {
@@ -1638,7 +1670,7 @@ func (c *EClient) calculateOptionPriceProtoBuf(calculateOptionPriceRequestProto 
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelCalculateOptionPrice cancels the calculation of option price.
@@ -1668,7 +1700,7 @@ func (c *EClient) CancelCalculateOptionPrice(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelCalculateOptionPriceProtoBuf(cancelCalculateOptionPriceProto *protobuf.CancelCalculateOptionPrice) {
@@ -1695,7 +1727,7 @@ func (c *EClient) cancelCalculateOptionPriceProtoBuf(cancelCalculateOptionPriceP
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ExerciseOptions exercises the option defined by the contract.
@@ -1791,7 +1823,7 @@ func (c *EClient) ExerciseOptions(reqID int64, contract *Contract, exerciseActio
 		me.encodeBool(professionalCustomer)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) exerciseOptionsProtoBuf(exerciseOptionsRequestProto *protobuf.ExerciseOptionsRequest) {
@@ -1818,7 +1850,7 @@ func (c *EClient) exerciseOptionsProtoBuf(exerciseOptionsRequestProto *protobuf.
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(orderID, me.Bytes())
 }
 
 //	##########################################################################
@@ -2516,7 +2548,7 @@ func (c *EClient) PlaceOrder(orderID int64, contract *Contract, order *Order) {
 		me.encodeBool(order.ImbalanceOnly)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(orderID, me.Bytes())
 }
 
 func (c *EClient) placeOrderProtoBuf(placeOrderRequestProto *protobuf.PlaceOrderRequest) {
@@ -2560,7 +2592,7 @@ func (c *EClient) placeOrderProtoBuf(placeOrderRequestProto *protobuf.PlaceOrder
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(orderID, me.Bytes())
 }
 
 func (c *EClient) validateOrderParameters(order *protobuf.Order) string {
@@ -2672,7 +2704,7 @@ func (c *EClient) CancelOrder(orderID int64, orderCancel OrderCancel) {
 		me.encodeInt64(orderCancel.ManualOrderIndicator)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(orderID, me.Bytes())
 }
 
 func (c *EClient) cancelOrderProtoBuf(cancelOrderRequestProto *protobuf.CancelOrderRequest) {
@@ -2699,7 +2731,7 @@ func (c *EClient) cancelOrderProtoBuf(cancelOrderRequestProto *protobuf.CancelOr
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(orderID, me.Bytes())
 }
 
 // CancelOrderAsync cancel an order by orderId.
@@ -2727,7 +2759,7 @@ func (c *EClient) ReqOpenOrders() {
 	me.encodeMsgID(REQ_OPEN_ORDERS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqOpenOrdersProtoBuf(openOrdersRequestProto *protobuf.OpenOrdersRequest) {
@@ -2749,7 +2781,7 @@ func (c *EClient) reqOpenOrdersProtoBuf(openOrdersRequestProto *protobuf.OpenOrd
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqAutoOpenOrders requests that newly created TWS orders be implicitly associated with the client.
@@ -2777,7 +2809,7 @@ func (c *EClient) ReqAutoOpenOrders(autoBind bool) {
 	me.encodeInt(VERSION)
 	me.encodeBool(autoBind)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqAutoOpenOrdersProtoBuf(autoOpenOrdersRequestProto *protobuf.AutoOpenOrdersRequest) {
@@ -2799,7 +2831,7 @@ func (c *EClient) reqAutoOpenOrdersProtoBuf(autoOpenOrdersRequestProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqAllOpenOrders request the open orders placed from all clients and also from TWS.
@@ -2824,7 +2856,7 @@ func (c *EClient) ReqAllOpenOrders() {
 	me.encodeMsgID(REQ_ALL_OPEN_ORDERS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqAllOpenOrdersProtoBuf(allOpenOrdersRequestProto *protobuf.AllOpenOrdersRequest) {
@@ -2846,7 +2878,7 @@ func (c *EClient) reqAllOpenOrdersProtoBuf(allOpenOrdersRequestProto *protobuf.A
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqGlobalCancel cancels all open orders globally. It cancels both API and TWS open orders.
@@ -2881,7 +2913,7 @@ func (c *EClient) ReqGlobalCancel(orderCancel OrderCancel) {
 		me.encodeInt64(orderCancel.ManualOrderIndicator)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqGlobalCancelProtoBuf(globalCancelRequestProto *protobuf.GlobalCancelRequest) {
@@ -2903,7 +2935,7 @@ func (c *EClient) reqGlobalCancelProtoBuf(globalCancelRequestProto *protobuf.Glo
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqIDs request from TWS the next valid ID that can be used when placing an order.
@@ -2930,7 +2962,7 @@ func (c *EClient) ReqIDs(numIds int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(numIds)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqIdsProtoBuf(idsRequestProto *protobuf.IdsRequest) {
@@ -2952,7 +2984,7 @@ func (c *EClient) reqIdsProtoBuf(idsRequestProto *protobuf.IdsRequest) {
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 //	##########################################################################
@@ -2984,7 +3016,7 @@ func (c *EClient) ReqAccountUpdates(subscribe bool, accountName string) {
 	// Send the account code. This will only be used for FA clients
 	me.encodeString(accountName) // srv v9 and above
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqAccountUpdatesProtoBuf(accountDataRequestProto *protobuf.AccountDataRequest) {
@@ -3005,7 +3037,7 @@ func (c *EClient) reqAccountUpdatesProtoBuf(accountDataRequestProto *protobuf.Ac
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqAccountSummary request and keep up to date the data that appears.
@@ -3072,7 +3104,7 @@ func (c *EClient) ReqAccountSummary(reqID int64, groupName string, tags string) 
 	me.encodeString(groupName)
 	me.encodeString(tags)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqAccountSummaryProtoBuf(accountSummaryRequestProto *protobuf.AccountSummaryRequest) {
@@ -3099,7 +3131,7 @@ func (c *EClient) reqAccountSummaryProtoBuf(accountSummaryRequestProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelAccountSummary cancels the request for Account Window Summary tab data.
@@ -3124,7 +3156,7 @@ func (c *EClient) CancelAccountSummary(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelAccountSummaryProtoBuf(cancelAccountSummaryRequestProto *protobuf.CancelAccountSummary) {
@@ -3151,7 +3183,7 @@ func (c *EClient) cancelAccountSummaryProtoBuf(cancelAccountSummaryRequestProto 
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqPositions requests real-time position data for all accounts.
@@ -3179,7 +3211,7 @@ func (c *EClient) ReqPositions() {
 	me.encodeMsgID(REQ_POSITIONS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqPositionsProtoBuf(positionsRequestProto *protobuf.PositionsRequest) {
@@ -3201,7 +3233,7 @@ func (c *EClient) reqPositionsProtoBuf(positionsRequestProto *protobuf.Positions
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 
 }
 
@@ -3230,7 +3262,7 @@ func (c *EClient) CancelPositions() {
 	me.encodeMsgID(CANCEL_POSITIONS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) cancelPositionsProtoBuf(cancelPositionsRequestProto *protobuf.CancelPositions) {
@@ -3251,7 +3283,7 @@ func (c *EClient) cancelPositionsProtoBuf(cancelPositionsRequestProto *protobuf.
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqPositionsMulti requests the positions for account and/or model.
@@ -3283,7 +3315,7 @@ func (c *EClient) ReqPositionsMulti(reqID int64, account string, modelCode strin
 	me.encodeString(account)
 	me.encodeString(modelCode)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqPositionsMultiProtoBuf(positionsMultiRequestProto *protobuf.PositionsMultiRequest) {
@@ -3310,7 +3342,7 @@ func (c *EClient) reqPositionsMultiProtoBuf(positionsMultiRequestProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelPositionsMulti cancels the positions update of assigned account.
@@ -3339,7 +3371,7 @@ func (c *EClient) CancelPositionsMulti(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelPositionsMultiProtoBuf(cancelPositionsMultiRequestProto *protobuf.CancelPositionsMulti) {
@@ -3366,7 +3398,7 @@ func (c *EClient) cancelPositionsMultiProtoBuf(cancelPositionsMultiRequestProto 
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqAccountUpdatesMulti requests account updates for account and/or model.
@@ -3398,7 +3430,7 @@ func (c *EClient) ReqAccountUpdatesMulti(reqID int64, account string, modelCode 
 	me.encodeString(modelCode)
 	me.encodeBool(ledgerAndNLV)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqAccountUpdatesMultiProtoBuf(accountUpdatesMultiRequestProto *protobuf.AccountUpdatesMultiRequest) {
@@ -3425,7 +3457,7 @@ func (c *EClient) reqAccountUpdatesMultiProtoBuf(accountUpdatesMultiRequestProto
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelAccountUpdatesMulti cancels account update for reqID.
@@ -3454,7 +3486,7 @@ func (c *EClient) CancelAccountUpdatesMulti(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelAccountUpdatesMultiProtoBuf(cancelAccountUpdatesMultiRequestProto *protobuf.CancelAccountUpdatesMulti) {
@@ -3481,7 +3513,7 @@ func (c *EClient) cancelAccountUpdatesMultiProtoBuf(cancelAccountUpdatesMultiReq
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -3513,7 +3545,7 @@ func (c *EClient) ReqPnL(reqID int64, account string, modelCode string) {
 	me.encodeString(account)
 	me.encodeString(modelCode)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqPnLProtoBuf(pnlRequestProto *protobuf.PnLRequest) {
@@ -3540,7 +3572,7 @@ func (c *EClient) reqPnLProtoBuf(pnlRequestProto *protobuf.PnLRequest) {
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelPnL cancels the PnL update of assigned account.
@@ -3566,7 +3598,7 @@ func (c *EClient) CancelPnL(reqID int64) {
 	me.encodeMsgID(CANCEL_PNL)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelPnLProtoBuf(cancelPnLProto *protobuf.CancelPnL) {
@@ -3593,7 +3625,7 @@ func (c *EClient) cancelPnLProtoBuf(cancelPnLProto *protobuf.CancelPnL) {
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqPnLSingle request and subscribe the single contract PnL of assigned account.
@@ -3622,7 +3654,7 @@ func (c *EClient) ReqPnLSingle(reqID int64, account string, modelCode string, co
 	me.encodeString(modelCode)
 	me.encodeInt64(contractID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqPnLSingleProtoBuf(pnlSingleRequestProto *protobuf.PnLSingleRequest) {
@@ -3649,7 +3681,7 @@ func (c *EClient) reqPnLSingleProtoBuf(pnlSingleRequestProto *protobuf.PnLSingle
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelPnLSingle cancel the single contract PnL update of assigned account.
@@ -3675,7 +3707,7 @@ func (c *EClient) CancelPnLSingle(reqID int64) {
 	me.encodeMsgID(CANCEL_PNL_SINGLE)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelPnLSingleProtoBuf(cancelPnLSingleProto *protobuf.CancelPnLSingle) {
@@ -3702,7 +3734,7 @@ func (c *EClient) cancelPnLSingleProtoBuf(cancelPnLSingleProto *protobuf.CancelP
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -3763,7 +3795,7 @@ func (c *EClient) ReqExecutions(reqID int64, execFilter *ExecutionFilter) {
 		}
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqExecutionProtobuf(executionRequestProto *protobuf.ExecutionRequest) {
@@ -3789,7 +3821,7 @@ func (c *EClient) reqExecutionProtobuf(executionRequestProto *protobuf.Execution
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -3878,7 +3910,7 @@ func (c *EClient) ReqContractDetails(reqID int64, contract *Contract) {
 		me.encodeString(contract.IssuerID)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqContractDataProtoBuf(contractDataRequestProto *protobuf.ContractDataRequest) {
@@ -3905,7 +3937,7 @@ func (c *EClient) reqContractDataProtoBuf(contractDataRequestProto *protobuf.Con
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -3934,7 +3966,7 @@ func (c *EClient) ReqMktDepthExchanges() {
 
 	me.encodeMsgID(REQ_MKT_DEPTH_EXCHANGES)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqMarketDepthExchangesProtoBuf(marketDepthExchangesRequestProto *protobuf.MarketDepthExchangesRequest) {
@@ -3956,7 +3988,7 @@ func (c *EClient) reqMarketDepthExchangesProtoBuf(marketDepthExchangesRequestPro
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqMktDepth requests the market depth for a specific contract.
@@ -4043,7 +4075,7 @@ func (c *EClient) ReqMktDepth(reqID int64, contract *Contract, numRows int, isSm
 		me.encodeTagValues(mktDepthOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqMarketDepthProtoBuf(marketDepthRequestProto *protobuf.MarketDepthRequest) {
@@ -4070,7 +4102,7 @@ func (c *EClient) reqMarketDepthProtoBuf(marketDepthRequestProto *protobuf.Marke
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelMktDepth cancels market depth updates.
@@ -4103,7 +4135,7 @@ func (c *EClient) CancelMktDepth(reqID int64, isSmartDepth bool) {
 		me.encodeBool(isSmartDepth)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelMarketDepthProtoBuf(cancelMarketDepthProto *protobuf.CancelMarketDepth) {
@@ -4130,7 +4162,7 @@ func (c *EClient) cancelMarketDepthProtoBuf(cancelMarketDepthProto *protobuf.Can
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -4162,7 +4194,7 @@ func (c *EClient) ReqNewsBulletins(allMsgs bool) {
 	me.encodeInt(VERSION)
 	me.encodeBool(allMsgs)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqNewsBulletinsProtoBuf(newsBulletinsRequestProto *protobuf.NewsBulletinsRequest) {
@@ -4183,7 +4215,7 @@ func (c *EClient) reqNewsBulletinsProtoBuf(newsBulletinsRequestProto *protobuf.N
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // CancelNewsBulletins cancels the news bulletins updates
@@ -4206,7 +4238,7 @@ func (c *EClient) CancelNewsBulletins() {
 	me.encodeMsgID(CANCEL_NEWS_BULLETINS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) cancelNewsBulletinsProtoBuf(cancelNewsBulletinsProto *protobuf.CancelNewsBulletins) {
@@ -4227,7 +4259,7 @@ func (c *EClient) cancelNewsBulletinsProtoBuf(cancelNewsBulletinsProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 //	##########################################################################
@@ -4256,7 +4288,7 @@ func (c *EClient) ReqManagedAccts() {
 	me.encodeMsgID(REQ_MANAGED_ACCTS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqManagedAcctsProtoBuf(managedAccountsRequestProto *protobuf.ManagedAccountsRequest) {
@@ -4277,7 +4309,7 @@ func (c *EClient) reqManagedAcctsProtoBuf(managedAccountsRequestProto *protobuf.
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 
 }
 
@@ -4309,7 +4341,7 @@ func (c *EClient) RequestFA(faDataType FaDataType) {
 	me.encodeInt(VERSION)
 	me.encodeInt(int(faDataType))
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqFAProtoBuf(faRequestProto *protobuf.FARequest) {
@@ -4330,7 +4362,7 @@ func (c *EClient) reqFAProtoBuf(faRequestProto *protobuf.FARequest) {
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 
 }
 
@@ -4370,7 +4402,7 @@ func (c *EClient) ReplaceFA(reqID int64, faDataType FaDataType, cxml string) {
 		me.encodeInt64(reqID)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) replaceFAProtoBuf(faReplaceProto *protobuf.FAReplace) {
@@ -4397,7 +4429,7 @@ func (c *EClient) replaceFAProtoBuf(faReplaceProto *protobuf.FAReplace) {
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -4527,7 +4559,7 @@ func (c *EClient) ReqHistoricalData(reqID int64, contract *Contract, endDateTime
 		me.encodeTagValues(chartOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqHistoricalDataProtoBuf(historicalDataRequestProto *protobuf.HistoricalDataRequest) {
@@ -4554,7 +4586,7 @@ func (c *EClient) reqHistoricalDataProtoBuf(historicalDataRequestProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelHistoricalData cancels the update of historical data.
@@ -4580,7 +4612,7 @@ func (c *EClient) CancelHistoricalData(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelHistoricalDataProtoBuf(cancelHistoricalDataProto *protobuf.CancelHistoricalData) {
@@ -4607,7 +4639,7 @@ func (c *EClient) cancelHistoricalDataProtoBuf(cancelHistoricalDataProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqHeadTimeStamp request the head timestamp of assigned contract.
@@ -4638,7 +4670,7 @@ func (c *EClient) ReqHeadTimeStamp(reqID int64, contract *Contract, whatToShow s
 	me.encodeString(whatToShow)
 	me.encodeInt(formatDate)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqHeadTimestampProtoBuf(headTimestampRequestProto *protobuf.HeadTimestampRequest) {
@@ -4665,7 +4697,7 @@ func (c *EClient) reqHeadTimestampProtoBuf(headTimestampRequestProto *protobuf.H
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelHeadTimeStamp cancels the head timestamp data.
@@ -4691,7 +4723,7 @@ func (c *EClient) CancelHeadTimeStamp(reqID int64) {
 	me.encodeMsgID(CANCEL_HEAD_TIMESTAMP)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelHeadTimestampProtoBuf(cancelHeadTimestampProto *protobuf.CancelHeadTimestamp) {
@@ -4718,7 +4750,7 @@ func (c *EClient) cancelHeadTimestampProtoBuf(cancelHeadTimestampProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqHistogramData requests histogram data.
@@ -4747,7 +4779,7 @@ func (c *EClient) ReqHistogramData(reqID int64, contract *Contract, useRTH bool,
 	me.encodeBool(useRTH)
 	me.encodeString(timePeriod)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqHistogramDataProtoBuf(histogramDataRequestProto *protobuf.HistogramDataRequest) {
@@ -4774,7 +4806,7 @@ func (c *EClient) reqHistogramDataProtoBuf(histogramDataRequestProto *protobuf.H
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelHistogramData cancels histogram data.
@@ -4800,7 +4832,7 @@ func (c *EClient) CancelHistogramData(reqID int64) {
 	me.encodeMsgID(CANCEL_HISTOGRAM_DATA)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelHistogramDataProtoBuf(cancelHistogramDataProto *protobuf.CancelHistogramData) {
@@ -4827,7 +4859,7 @@ func (c *EClient) cancelHistogramDataProtoBuf(cancelHistogramDataProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqHistoricalTicks requests historical ticks.
@@ -4861,7 +4893,7 @@ func (c *EClient) ReqHistoricalTicks(reqID int64, contract *Contract, startDateT
 	me.encodeBool(ignoreSize)
 	me.encodeTagValues(miscOptions)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqHistoricalTicksProtoBuf(historicalTicksRequestProto *protobuf.HistoricalTicksRequest) {
@@ -4888,7 +4920,7 @@ func (c *EClient) reqHistoricalTicksProtoBuf(historicalTicksRequestProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -4915,7 +4947,7 @@ func (c *EClient) ReqScannerParameters() {
 	me.encodeMsgID(REQ_SCANNER_PARAMETERS)
 	me.encodeInt(VERSION)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqScannerParametersProtoBuf(scannerParametersRequestProto *protobuf.ScannerParametersRequest) {
@@ -4937,7 +4969,7 @@ func (c *EClient) reqScannerParametersProtoBuf(scannerParametersRequestProto *pr
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqScannerSubscription subcribes a scanner that matched the subcription.
@@ -5002,7 +5034,7 @@ func (c *EClient) ReqScannerSubscription(reqID int64, subscription *ScannerSubsc
 		me.encodeTagValues(scannerSubscriptionOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqScannerSubscriptionProtoBuf(scannerSubscriptionRequestProto *protobuf.ScannerSubscriptionRequest) {
@@ -5029,7 +5061,7 @@ func (c *EClient) reqScannerSubscriptionProtoBuf(scannerSubscriptionRequestProto
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelScannerSubscription cancel scanner.
@@ -5054,7 +5086,7 @@ func (c *EClient) CancelScannerSubscription(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelScannerSubscriptionProtoBuf(cancelScannerSubscriptionProto *protobuf.CancelScannerSubscription) {
@@ -5081,7 +5113,7 @@ func (c *EClient) cancelScannerSubscriptionProtoBuf(cancelScannerSubscriptionPro
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -5165,7 +5197,7 @@ func (c *EClient) ReqRealTimeBars(reqID int64, contract *Contract, barSize int, 
 		me.encodeTagValues(realTimeBarsOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqRealTimeBarsProtoBuf(realTimeBarsRequestProto *protobuf.RealTimeBarsRequest) {
@@ -5192,7 +5224,7 @@ func (c *EClient) reqRealTimeBarsProtoBuf(realTimeBarsRequestProto *protobuf.Rea
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelRealTimeBars cancels realtime bars.
@@ -5216,7 +5248,7 @@ func (c *EClient) CancelRealTimeBars(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelRealTimeBarsProtoBuf(cancelRealTimeBarsProto *protobuf.CancelRealTimeBars) {
@@ -5243,7 +5275,7 @@ func (c *EClient) cancelRealTimeBarsProtoBuf(cancelRealTimeBarsProto *protobuf.C
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -5313,7 +5345,7 @@ func (c *EClient) ReqFundamentalData(reqID int64, contract *Contract, reportType
 		me.encodeTagValues(fundamentalDataOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqFundamentalsDataProtoBuf(fundamentalsDataRequestProto *protobuf.FundamentalsDataRequest) {
@@ -5340,7 +5372,7 @@ func (c *EClient) reqFundamentalsDataProtoBuf(fundamentalsDataRequestProto *prot
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelFundamentalData cancels fundamental data.
@@ -5369,7 +5401,7 @@ func (c *EClient) CancelFundamentalData(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 
 }
 
@@ -5397,7 +5429,7 @@ func (c *EClient) cancelFundamentalsDataProtoBuf(cancelFundamentalsDataProto *pr
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -5426,7 +5458,7 @@ func (c *EClient) ReqNewsProviders() {
 
 	me.encodeMsgID(REQ_NEWS_PROVIDERS)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqNewsProvidersProtoBuf(newsProvidersRequestProto *protobuf.NewsProvidersRequest) {
@@ -5448,7 +5480,7 @@ func (c *EClient) reqNewsProvidersProtoBuf(newsProvidersRequestProto *protobuf.N
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqNewsArticle request news article.
@@ -5480,7 +5512,7 @@ func (c *EClient) ReqNewsArticle(reqID int64, providerCode string, articleID str
 		me.encodeTagValues(newsArticleOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqNewsArticleProtoBuf(newsArticleRequestProto *protobuf.NewsArticleRequest) {
@@ -5507,7 +5539,7 @@ func (c *EClient) reqNewsArticleProtoBuf(newsArticleRequestProto *protobuf.NewsA
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqHistoricalNews request historical news.
@@ -5542,7 +5574,7 @@ func (c *EClient) ReqHistoricalNews(reqID int64, contractID int64, providerCode 
 		me.encodeTagValues(historicalNewsOptions)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqHistoricalNewsProtoBuf(historicalNewsRequestProto *protobuf.HistoricalNewsRequest) {
@@ -5569,7 +5601,7 @@ func (c *EClient) reqHistoricalNewsProtoBuf(historicalNewsRequestProto *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 //	##########################################################################
@@ -5602,7 +5634,7 @@ func (c *EClient) QueryDisplayGroups(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) queryDisplayGroupsProtoBuf(queryDisplayGroupsRequest *protobuf.QueryDisplayGroupsRequest) {
@@ -5629,7 +5661,7 @@ func (c *EClient) queryDisplayGroupsProtoBuf(queryDisplayGroupsRequest *protobuf
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // SubscribeToGroupEvents subcribes the group events.
@@ -5661,7 +5693,7 @@ func (c *EClient) SubscribeToGroupEvents(reqID int64, groupID int) {
 	me.encodeInt64(reqID)
 	me.encodeInt(groupID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) subscribeToGroupEventsProtoBuf(subscribeToGroupEventsRequestProto *protobuf.SubscribeToGroupEventsRequest) {
@@ -5688,7 +5720,7 @@ func (c *EClient) subscribeToGroupEventsProtoBuf(subscribeToGroupEventsRequestPr
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // UpdateDisplayGroup updates the display group in TWS.
@@ -5726,7 +5758,7 @@ func (c *EClient) UpdateDisplayGroup(reqID int64, contractInfo string) {
 	me.encodeInt64(reqID)
 	me.encodeString(contractInfo)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) updateDisplayGroupProtoBuf(updateDisplayGroupRequestProto *protobuf.UpdateDisplayGroupRequest) {
@@ -5753,7 +5785,7 @@ func (c *EClient) updateDisplayGroupProtoBuf(updateDisplayGroupRequestProto *pro
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // UnsubscribeFromGroupEvents unsubcribes the display group events.
@@ -5782,7 +5814,7 @@ func (c *EClient) UnsubscribeFromGroupEvents(reqID int64) {
 	me.encodeInt(VERSION)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) unsubscribeFromGroupEventsProtoBuf(unsubscribeFromGroupEventsRequestProto *protobuf.UnsubscribeFromGroupEventsRequest) {
@@ -5809,7 +5841,7 @@ func (c *EClient) unsubscribeFromGroupEventsProtoBuf(unsubscribeFromGroupEventsR
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // VerifyRequest is just for IB's internal use.
@@ -5846,7 +5878,7 @@ func (c *EClient) VerifyRequest(apiName string, apiVersion string) {
 	me.encodeString(apiName)
 	me.encodeString(apiVersion)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) verifyRequestProtoBuf(VerifyRequest *protobuf.VerifyRequest) {
@@ -5868,7 +5900,7 @@ func (c *EClient) verifyRequestProtoBuf(VerifyRequest *protobuf.VerifyRequest) {
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // VerifyMessage is just for IB's internal use.
@@ -5898,7 +5930,7 @@ func (c *EClient) VerifyMessage(apiData string) {
 	me.encodeInt(VERSION)
 	me.encodeString(apiData)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) verifyMessageProtoBuf(verifyMessageRequestProto *protobuf.VerifyMessageRequest) {
@@ -5920,7 +5952,7 @@ func (c *EClient) verifyMessageProtoBuf(verifyMessageRequestProto *protobuf.Veri
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // VerifyAndAuthRequest is just for IB's internal use.
@@ -5953,7 +5985,7 @@ func (c *EClient) VerifyAndAuthRequest(apiName string, apiVersion string, opaque
 	me.encodeString(apiVersion)
 	me.encodeString(opaqueIsvKey)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // VerifyAndAuthMessage is just for IB's internal use.
@@ -5979,7 +6011,7 @@ func (c *EClient) VerifyAndAuthMessage(apiData string, xyzResponse string) {
 	me.encodeString(apiData)
 	me.encodeString(xyzResponse)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqSecDefOptParams requests security definition option parameters.
@@ -6014,7 +6046,7 @@ func (c *EClient) ReqSecDefOptParams(reqID int64, underlyingSymbol string, futFo
 	me.encodeString(underlyingSecurityType)
 	me.encodeInt64(underlyingContractID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqSecDefOptParamsProtoBuf(secDefOptParamsRequestProto *protobuf.SecDefOptParamsRequest) {
@@ -6041,7 +6073,7 @@ func (c *EClient) reqSecDefOptParamsProtoBuf(secDefOptParamsRequestProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqSoftDollarTiers request pre-defined Soft Dollar Tiers.
@@ -6064,7 +6096,7 @@ func (c *EClient) ReqSoftDollarTiers(reqID int64) {
 	me.encodeMsgID(REQ_SOFT_DOLLAR_TIERS)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqSoftDollarTiersProtoBuf(softDollarTiersRequestProto *protobuf.SoftDollarTiersRequest) {
@@ -6091,7 +6123,7 @@ func (c *EClient) reqSoftDollarTiersProtoBuf(softDollarTiersRequestProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqFamilyCodes requests family codes.
@@ -6116,7 +6148,7 @@ func (c *EClient) ReqFamilyCodes() {
 
 	me.encodeMsgID(REQ_FAMILY_CODES)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqFamilyCodesProtoBuf(familyCodesRequestProto *protobuf.FamilyCodesRequest) {
@@ -6138,7 +6170,7 @@ func (c *EClient) reqFamilyCodesProtoBuf(familyCodesRequestProto *protobuf.Famil
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqMatchingSymbols requests matching symbols.
@@ -6165,7 +6197,7 @@ func (c *EClient) ReqMatchingSymbols(reqID int64, pattern string) {
 	me.encodeInt64(reqID)
 	me.encodeString(pattern)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqMatchingSymbolsProtoBuf(matchingSymbolsRequestProto *protobuf.MatchingSymbolsRequest) {
@@ -6192,7 +6224,7 @@ func (c *EClient) reqMatchingSymbolsProtoBuf(matchingSymbolsRequestProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqCompletedOrders request the completed orders.
@@ -6215,7 +6247,7 @@ func (c *EClient) ReqCompletedOrders(apiOnly bool) {
 	me.encodeMsgID(REQ_COMPLETED_ORDERS)
 	me.encodeBool(apiOnly)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqCompletedOrdersProtoBuf(completedOrdersRequestProto *protobuf.CompletedOrdersRequest) {
@@ -6237,7 +6269,7 @@ func (c *EClient) reqCompletedOrdersProtoBuf(completedOrdersRequestProto *protob
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // ReqWshMetaData requests WSHE Meta data.
@@ -6263,7 +6295,7 @@ func (c *EClient) ReqWshMetaData(reqID int64) {
 	me.encodeMsgID(REQ_WSH_META_DATA)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqWshMetaDataProtoBuf(wshMetaDataRequestProto *protobuf.WshMetaDataRequest) {
@@ -6290,7 +6322,7 @@ func (c *EClient) reqWshMetaDataProtoBuf(wshMetaDataRequestProto *protobuf.WshMe
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelWshMetaData cancels WSHE Meta data.
@@ -6316,7 +6348,7 @@ func (c *EClient) CancelWshMetaData(reqID int64) {
 	me.encodeMsgID(CANCEL_WSH_META_DATA)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelWshMetaDataProtoBuf(cancelWshMetaDataProto *protobuf.CancelWshMetaData) {
@@ -6343,7 +6375,7 @@ func (c *EClient) cancelWshMetaDataProtoBuf(cancelWshMetaDataProto *protobuf.Can
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqWshEventData requests WSHE Event data.
@@ -6393,7 +6425,7 @@ func (c *EClient) ReqWshEventData(reqID int64, wshEventData WshEventData) {
 		me.encodeInt64(wshEventData.TotalLimit)
 	}
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqWshEventDataProtoBuf(wshEventDataRequestProto *protobuf.WshEventDataRequest) {
@@ -6420,7 +6452,7 @@ func (c *EClient) reqWshEventDataProtoBuf(wshEventDataRequestProto *protobuf.Wsh
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelWshEventData cancels WSHE Event data.
@@ -6446,7 +6478,7 @@ func (c *EClient) CancelWshEventData(reqID int64) {
 	me.encodeMsgID(CANCEL_WSH_EVENT_DATA)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) cancelWshEventDataProtoBuf(cancelWshEventDataProto *protobuf.CancelWshEventData) {
@@ -6473,7 +6505,7 @@ func (c *EClient) cancelWshEventDataProtoBuf(cancelWshEventDataProto *protobuf.C
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqUserInfo requests user info.
@@ -6499,7 +6531,7 @@ func (c *EClient) ReqUserInfo(reqID int64) {
 	me.encodeMsgID(REQ_USER_INFO)
 	me.encodeInt64(reqID)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) reqUserInfoProtoBuf(userInfoRequestProto *protobuf.UserInfoRequest) {
@@ -6526,7 +6558,7 @@ func (c *EClient) reqUserInfoProtoBuf(userInfoRequestProto *protobuf.UserInfoReq
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // ReqCurrentTimeInMillis requests the current system time in milliseconds on the server side.
@@ -6551,7 +6583,7 @@ func (c *EClient) ReqCurrentTimeInMillis() {
 
 	me.encodeMsgID(REQ_CURRENT_TIME_IN_MILLIS)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 func (c *EClient) reqCurrentTimeInMillisProtoBuf(currentTimeInMillisRequestProto *protobuf.CurrentTimeInMillisRequest) {
@@ -6573,7 +6605,7 @@ func (c *EClient) reqCurrentTimeInMillisProtoBuf(currentTimeInMillisRequestProto
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(NO_VALID_ID, me.Bytes())
 }
 
 // CancelContractData cancels contract data request.
@@ -6609,7 +6641,7 @@ func (c *EClient) cancelContractDataProtoBuf(cancelContractDataProto *protobuf.C
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 // CancelHistoricalTicks cancels historical ticks request.
@@ -6645,7 +6677,7 @@ func (c *EClient) cancelHistoricalTicksProtoBuf(cancelHistoricalTicksProto *prot
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) ReqConfigProtoBuf(configRequestProto *protobuf.ConfigRequest) {
@@ -6676,7 +6708,7 @@ func (c *EClient) ReqConfigProtoBuf(configRequestProto *protobuf.ConfigRequest) 
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
 
 func (c *EClient) UpdateConfigProtoBuf(updateConfigRequestProto *protobuf.UpdateConfigRequest) {
@@ -6707,5 +6739,5 @@ func (c *EClient) UpdateConfigProtoBuf(updateConfigRequestProto *protobuf.Update
 
 	me.encodeProto(msg)
 
-	c.reqChan <- me.Bytes()
+	c.enqueue(reqID, me.Bytes())
 }
