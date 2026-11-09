@@ -152,8 +152,6 @@ func (d *EDecoder) parseAndProcessMsg(msgBytes []byte) {
 			d.processScannerParametersMsgProtoBuf(msgBuf)
 		case SCANNER_DATA:
 			d.processScannerDataMsgProtoBuf(msgBuf)
-		case FUNDAMENTAL_DATA:
-			d.processFundamentalsDataMsgProtoBuf(msgBuf)
 		case PNL:
 			d.processPnLMsgProtoBuf(msgBuf)
 		case PNL_SINGLE:
@@ -263,8 +261,6 @@ func (d *EDecoder) parseAndProcessMsg(msgBytes []byte) {
 			d.processCurrentTimeMsg(msgBuf)
 		case REAL_TIME_BARS:
 			d.processRealTimeBarsMsg(msgBuf)
-		case FUNDAMENTAL_DATA:
-			d.processFundamentalDataMsg(msgBuf)
 		case CONTRACT_DATA_END:
 			d.processContractDataEndMsg(msgBuf)
 		case OPEN_ORDER_END:
@@ -844,7 +840,7 @@ func (d *EDecoder) processOrderStatusMsgProtoBuf(msgBuf *MsgBuffer) {
 	}
 	var permID int64
 	if orderStatusProto.PermId != nil {
-		permID = int64(orderStatusProto.GetPermId())
+		permID = orderStatusProto.GetPermId()
 	}
 	var parentID int64
 	if orderStatusProto.ParentId != nil {
@@ -885,12 +881,12 @@ func (d *EDecoder) processErrorMsg(msgBuf *MsgBuffer) {
 	if d.serverVersion >= MIN_SERVER_VER_ADVANCED_ORDER_REJECT {
 		advancedOrderRejectJson = msgBuf.decodeString()
 	}
-	var errorTime int64
+	var errorTimeMs int64
 	if d.serverVersion >= MIN_SERVER_VER_ERROR_TIME {
-		errorTime = msgBuf.decodeInt64()
+		errorTimeMs = msgBuf.decodeInt64()
 	}
 
-	d.wrapper.Error(reqID, errorTime, errorCode, errorString, advancedOrderRejectJson)
+	d.wrapper.Error(reqID, errorTimeMs, errorCode, errorString, advancedOrderRejectJson)
 }
 
 func (d *EDecoder) processErrorMsgProtoBuf(msgBuf *MsgBuffer) {
@@ -908,9 +904,9 @@ func (d *EDecoder) processErrorMsgProtoBuf(msgBuf *MsgBuffer) {
 	if errorMessageProto.Id != nil {
 		reqID = int64(errorMessageProto.GetId())
 	}
-	var errorTime int64
+	var errorTimeMs int64
 	if errorMessageProto.ErrorTime != nil {
-		errorTime = int64(errorMessageProto.GetErrorTime())
+		errorTimeMs = errorMessageProto.GetErrorTime()
 	}
 	var errorCode int64
 	if errorMessageProto.ErrorCode != nil {
@@ -925,7 +921,7 @@ func (d *EDecoder) processErrorMsgProtoBuf(msgBuf *MsgBuffer) {
 		advancedOrderRejectJson = errorMessageProto.GetAdvancedOrderRejectJson()
 	}
 
-	d.wrapper.Error(reqID, errorTime, errorCode, errorString, advancedOrderRejectJson)
+	d.wrapper.Error(reqID, errorTimeMs, errorCode, errorString, advancedOrderRejectJson)
 }
 
 func (d *EDecoder) processOpenOrderMsg(msgBuf *MsgBuffer) {
@@ -1621,7 +1617,7 @@ func (d *EDecoder) processExecutionDetailsMsgProtoBuf(msgBuf *MsgBuffer) {
 
 	d.wrapper.ExecDetailsProtoBuf(&executionDetailsProto)
 
-	var reqID int64 = int64(executionDetailsProto.GetReqId())
+	reqID := int64(executionDetailsProto.GetReqId())
 
 	var contract *Contract
 	if executionDetailsProto.Contract != nil {
@@ -2155,16 +2151,6 @@ func (d *EDecoder) processRealTimeBarsMsgProtoBuf(msgBuf *MsgBuffer) {
 	d.wrapper.RealtimeBar(reqID, t, open, high, low, close, volume, wap, count)
 }
 
-func (d *EDecoder) processFundamentalDataMsg(msgBuf *MsgBuffer) {
-
-	msgBuf.decode() // version
-
-	reqID := msgBuf.decodeInt64()
-	data := msgBuf.decodeString()
-
-	d.wrapper.FundamentalData(reqID, data)
-}
-
 func (d *EDecoder) processContractDataEndMsg(msgBuf *MsgBuffer) {
 
 	msgBuf.decode() // version
@@ -2172,27 +2158,6 @@ func (d *EDecoder) processContractDataEndMsg(msgBuf *MsgBuffer) {
 	reqID := msgBuf.decodeInt64()
 
 	d.wrapper.ContractDetailsEnd(reqID)
-}
-
-func (d *EDecoder) processFundamentalsDataMsgProtoBuf(msgBuf *MsgBuffer) {
-	var fundamentalsDataProto protobuf.FundamentalsData
-	if err := proto.Unmarshal(msgBuf.bs, &fundamentalsDataProto); err != nil {
-		log.Error().Err(err).Msg("failed to unmarshal FundamentalsData message")
-		return
-	}
-
-	d.wrapper.FundamentalsDataProtoBuf(&fundamentalsDataProto)
-
-	reqID := NO_VALID_ID
-	if fundamentalsDataProto.ReqId != nil {
-		reqID = int64(fundamentalsDataProto.GetReqId())
-	}
-	data := ""
-	if fundamentalsDataProto.Data != nil {
-		data = fundamentalsDataProto.GetData()
-	}
-
-	d.wrapper.FundamentalData(reqID, data)
 }
 
 func (d *EDecoder) processContractDataEndMsgProtoBuf(msgBuf *MsgBuffer) {
@@ -3191,13 +3156,13 @@ func (d *EDecoder) processTickNewsMsg(msgBuf *MsgBuffer) {
 
 	tickerID := msgBuf.decodeInt64()
 
-	timeStamp := msgBuf.decodeInt64()
+	timeStampMs := msgBuf.decodeInt64()
 	providerCode := msgBuf.decodeString()
 	articleID := msgBuf.decodeString()
 	headline := msgBuf.decodeString()
 	extraData := msgBuf.decodeString()
 
-	d.wrapper.TickNews(tickerID, timeStamp, providerCode, articleID, headline, extraData)
+	d.wrapper.TickNews(tickerID, timeStampMs, providerCode, articleID, headline, extraData)
 }
 
 func (d *EDecoder) processTickNewsMsgProtoBuf(msgBuf *MsgBuffer) {
@@ -3212,9 +3177,9 @@ func (d *EDecoder) processTickNewsMsgProtoBuf(msgBuf *MsgBuffer) {
 	if tickNewsProto.ReqId != nil {
 		reqID = int64(tickNewsProto.GetReqId())
 	}
-	timestamp := int64(0)
+	timeStampMs := int64(0)
 	if tickNewsProto.Timestamp != nil {
-		timestamp = tickNewsProto.GetTimestamp()
+		timeStampMs = tickNewsProto.GetTimestamp()
 	}
 	providerCode := ""
 	if tickNewsProto.ProviderCode != nil {
@@ -3233,7 +3198,7 @@ func (d *EDecoder) processTickNewsMsgProtoBuf(msgBuf *MsgBuffer) {
 		extraData = tickNewsProto.GetExtraData()
 	}
 
-	d.wrapper.TickNews(reqID, timestamp, providerCode, articleID, headline, extraData)
+	d.wrapper.TickNews(reqID, timeStampMs, providerCode, articleID, headline, extraData)
 }
 
 func (d *EDecoder) processTickReqParamsMsg(msgBuf *MsgBuffer) {
@@ -4072,7 +4037,7 @@ func (d *EDecoder) processOrderBoundMsgProtoBuf(msgBuf *MsgBuffer) {
 
 	var permID int64
 	if orderBoundProto.PermId != nil {
-		permID = int64(orderBoundProto.GetPermId())
+		permID = orderBoundProto.GetPermId()
 	}
 	var clientID int64
 	if orderBoundProto.PermId != nil {

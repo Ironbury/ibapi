@@ -48,6 +48,7 @@ func MarketOrder(action string, quantity Decimal) *Order {
 	order.Action = action
 	order.OrderType = "MKT"
 	order.TotalQuantity = quantity
+	order.TIF = "DAY"
 
 	return order
 }
@@ -751,8 +752,8 @@ func Volatility(action string, quantity Decimal, volatilityPercent float64, vola
 	return order
 }
 
-// MarketFHedge .
-func MarketFHedge(parentOrderId int64, action string) *Order {
+// MarketFxHedge .
+func MarketFxHedge(parentOrderId int64, action string) *Order {
 
 	// FX Hedge orders can only have a quantity of 0
 	order := MarketOrder(action, ZERO)

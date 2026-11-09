@@ -173,7 +173,7 @@ func decodeExecution(executionProto *protobuf.Execution) *Execution {
 		execution.Price = executionProto.GetPrice()
 	}
 	if executionProto.PermId != nil {
-		execution.PermID = int64(executionProto.GetPermId())
+		execution.PermID = executionProto.GetPermId()
 	}
 	if executionProto.IsLiquidation != nil {
 		execution.Liquidation = BoolToInt64(executionProto.GetIsLiquidation())
@@ -224,7 +224,7 @@ func decodeOrder(orderID int64, contractProto *protobuf.Contract, orderProto *pr
 		order.OrderID = int64(orderProto.GetOrderId())
 	}
 	if orderProto.PermId != nil {
-		order.PermID = int64(orderProto.GetPermId())
+		order.PermID = orderProto.GetPermId()
 	}
 	if orderProto.ParentId != nil {
 		order.ParentID = int64(orderProto.GetParentId())
@@ -532,6 +532,9 @@ func decodeOrder(orderID int64, contractProto *protobuf.Contract, orderProto *pr
 	}
 	if orderProto.ConditionsIgnoreRth != nil {
 		order.ConditionsIgnoreRth = orderProto.GetConditionsIgnoreRth()
+	}
+	if orderProto.ConditionsIncludeOvernight != nil {
+		order.ConditionsIncludeOvernight = orderProto.GetConditionsIncludeOvernight()
 	}
 	// models
 	if orderProto.ModelCode != nil {
@@ -1140,6 +1143,9 @@ func decodeContractDetails(contractProto *protobuf.Contract, contractDetailsProt
 	}
 	if contractDetailsProto.EventContractDescription2 != nil {
 		contractDetails.EventContractDescription2 = contractDetailsProto.GetEventContractDescription2()
+	}
+	if contractDetailsProto.SettlementMethod != nil {
+		contractDetails.SettlementMethod = contractDetailsProto.GetSettlementMethod()
 	}
 
 	return contractDetails

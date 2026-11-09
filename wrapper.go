@@ -86,7 +86,7 @@ type EWrapper interface {
 	// ExecDetailsEnd is called once all executions have been sent to a client in response to reqExecutions().
 	ExecDetailsEnd(reqID int64)
 	// Error is called when there is an error with the communication or when TWS wants to send a message to the client.
-	Error(reqID int64, errTime int64, errCode int64, errString string, advancedOrderRejectJson string)
+	Error(reqID int64, errTimeMs int64, errCode int64, errString string, advancedOrderRejectJson string)
 	// UpdateMktDepth returns the order book.
 	// 	int64 -  the request's identifier.
 	// 	position -  the order book's row being updated.
@@ -157,8 +157,6 @@ type EWrapper interface {
 	RealtimeBar(reqID int64, time int64, open float64, high float64, low float64, close float64, volume Decimal, wap Decimal, count int64)
 	// CurrentTime will receive IB server's system current time after the invokation of reqCurrentTime.
 	CurrentTime(t int64)
-	// FundamentalData
-	FundamentalData(reqID int64, data string)
 	// DeltaNeutralValidation
 	DeltaNeutralValidation(reqID int64, deltaNeutralContract DeltaNeutralContract)
 	// TickSnapshotEnd indicates the snapshot reception is finished.
@@ -223,7 +221,7 @@ type EWrapper interface {
 	// MktDepthExchanges .
 	MktDepthExchanges(depthMktDataDescriptions []DepthMktDataDescription)
 	// TickNews .
-	TickNews(int64 int64, timeStamp int64, providerCode string, articleID string, headline string, extraData string)
+	TickNews(int64 int64, timeStampMs int64, providerCode string, articleID string, headline string, extraData string)
 	// SmartComponents .
 	SmartComponents(reqID int64, smartComponents []SmartComponent)
 	// TickReqParams .
@@ -393,8 +391,6 @@ type EWrapper interface {
 	ScannerParametersProtoBuf(scannerParametersProto *protobuf.ScannerParameters)
 	// ScannerDataProtoBuf .
 	ScannerDataProtoBuf(scannerDataProto *protobuf.ScannerData)
-	// FundamentalsDataProtoBuf .
-	FundamentalsDataProtoBuf(fundamentalsDataProto *protobuf.FundamentalsData)
 	// PnLProtoBuf .
 	PnLProtoBuf(pnlProto *protobuf.PnL)
 	// PnLSingleProtoBuf .
@@ -561,8 +557,8 @@ func (w Wrapper) ExecDetailsEnd(reqID int64) {
 	log.Info().Int64("ReqID", reqID).Msg("<ExecDetailsEnd>")
 }
 
-func (w Wrapper) Error(reqID int64, errorTime int64, errCode int64, errString string, advancedOrderRejectJson string) {
-	logger := log.Error().Int64("ReqID", reqID).Int64("ErrorTime", errorTime).Int64("ErrCode", errCode).Str("ErrString", errString)
+func (w Wrapper) Error(reqID int64, errorTimeMs int64, errCode int64, errString string, advancedOrderRejectJson string) {
+	logger := log.Error().Int64("ReqID", reqID).Int64("ErrorTimeMs", errorTimeMs).Int64("ErrCode", errCode).Str("ErrString", errString)
 	if advancedOrderRejectJson != "" {
 		logger = logger.Str("AdvancedOrderRejectJson", advancedOrderRejectJson)
 	}
@@ -615,10 +611,6 @@ func (w Wrapper) RealtimeBar(reqID int64, time int64, open float64, high float64
 
 func (w Wrapper) CurrentTime(t int64) {
 	log.Info().Time("Server Time", time.Unix(t, 0)).Msg("<CurrentTime>")
-}
-
-func (w Wrapper) FundamentalData(reqID int64, data string) {
-	log.Info().Int64("ReqID", reqID).Str("Data", data).Msg("<FundamentalData>")
 }
 
 func (w Wrapper) DeltaNeutralValidation(reqID int64, deltaNeutralContract DeltaNeutralContract) {
@@ -728,8 +720,8 @@ func (w Wrapper) MktDepthExchanges(depthMktDataDescriptions []DepthMktDataDescri
 	log.Info().Any("DepthMktDataDescriptions", depthMktDataDescriptions).Msg("<MktDepthExchanges>")
 }
 
-func (w Wrapper) TickNews(int64 int64, timeStamp int64, providerCode string, articleID string, headline string, extraData string) {
-	log.Info().Int64("int64", int64).Str("TimeStamp", IntMaxString(timeStamp)).Str("ProviderCode", providerCode).Str("ArticleID", articleID).Str("Headline", headline).Str("ExtraData", extraData).Msg("<TickNews>")
+func (w Wrapper) TickNews(int64 int64, timeStampMs int64, providerCode string, articleID string, headline string, extraData string) {
+	log.Info().Int64("int64", int64).Str("TimeStampMs", IntMaxString(timeStampMs)).Str("ProviderCode", providerCode).Str("ArticleID", articleID).Str("Headline", headline).Str("ExtraData", extraData).Msg("<TickNews>")
 }
 
 func (w Wrapper) SmartComponents(reqID int64, smartComponents []SmartComponent) {
@@ -1083,10 +1075,6 @@ func (w Wrapper) ScannerParametersProtoBuf(scannerParametersProto *protobuf.Scan
 
 func (w Wrapper) ScannerDataProtoBuf(scannerDataProto *protobuf.ScannerData) {
 	log.Debug().Stringer("scannerDataProto", scannerDataProto).Msg("<ScannerDataProtoBuf>")
-}
-
-func (w Wrapper) FundamentalsDataProtoBuf(fundamentalsDataProto *protobuf.FundamentalsData) {
-	log.Debug().Stringer("fundamentalsDataProto", fundamentalsDataProto).Msg("<FundamentalsDataProtoBuf>")
 }
 
 func (w Wrapper) PnLProtoBuf(pnlProto *protobuf.PnL) {

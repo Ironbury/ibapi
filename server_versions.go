@@ -12,8 +12,7 @@ const (
 	// MIN_SERVER_VER_CONTRACT_CONID              Version = 37
 	MIN_SERVER_VER_SUPPORTED                          Version = 38 // 38 is the minimum supported version
 	MIN_SERVER_VER_PTA_ORDERS                         Version = 39
-	MIN_SERVER_VER_FUNDAMENTAL_DATA                   Version = 40
-	MIN_SERVER_VER_DELTA_NEUTRAL                      Version = 40
+	MIN_SERVER_VER_DELTA_NEUTRAL                      Version = 40 // MIN_SERVER_VER_FUNDAMENTAL_DATA Version = 40 was removed in API after v0.10.46
 	MIN_SERVER_VER_CONTRACT_DATA_CHAIN                Version = 40
 	MIN_SERVER_VER_SCALE_ORDERS2                      Version = 40
 	MIN_SERVER_VER_ALGO_ORDERS                        Version = 41
@@ -171,12 +170,13 @@ const (
 	MIN_SERVER_VER_UPDATE_CONFIG                      Version = 221
 	MIN_SERVER_VER_FRACTIONAL_LAST_SIZE               Version = 222
 	MIN_SERVER_VER_HEDGE_MAX_SIZE                     Version = 223
-	MIN_SERVER_VER_USE_PRECISION_FROM_SEC_DEFS        Version = 224
+	MIN_SERVER_VER_USE_PRECISION_FROM_SEC_DEF         Version = 224
 	MIN_SERVER_VER_ODD_LOT_BID_ASK_QUOTES             Version = 225
+	UNIFIED_VERSION_COND_ORDER_WITH_OVERNIGHT_PARAM   Version = 226
 
 	// 100+ messaging
 	// 100 = enhanced handshake, msg length prefixes
 
 	MIN_CLIENT_VER = 100
-	MAX_CLIENT_VER = MIN_SERVER_VER_ODD_LOT_BID_ASK_QUOTES
+	MAX_CLIENT_VER = UNIFIED_VERSION_COND_ORDER_WITH_OVERNIGHT_PARAM
 )

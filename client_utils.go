@@ -461,6 +461,9 @@ func createOrderProto(order *Order) (*protobuf.Order, error) {
 	if order.ConditionsIgnoreRth {
 		orderProto.ConditionsIgnoreRth = &order.ConditionsIgnoreRth
 	}
+	if order.ConditionsIncludeOvernight {
+		orderProto.ConditionsIncludeOvernight = &order.ConditionsIncludeOvernight
+	}
 
 	// models
 	if !stringIsEmpty(order.ModelCode) {
@@ -634,7 +637,7 @@ func createConditionsProto(order *Order) ([]*protobuf.OrderCondition, error) {
 // Base
 func createOrderConditionProto(cond OrderCondition) *protobuf.OrderCondition {
 	protoCond := &protobuf.OrderCondition{}
-	if isValidInt64Value(int64(cond.Type())) {
+	if isValidInt64Value(cond.Type()) {
 		t := int32(cond.Type())
 		protoCond.Type = &t
 	}
@@ -1604,7 +1607,7 @@ func createWshEventDataRequestProto(reqID int64, wshEventData *WshEventData) *pr
 		wshEventDataRequestProto.ReqId = &id
 	}
 
-	if isValidInt64Value(int64(wshEventData.ConID)) {
+	if isValidInt64Value(wshEventData.ConID) {
 		cid := int32(wshEventData.ConID)
 		wshEventDataRequestProto.ConId = &cid
 	}
@@ -1633,7 +1636,7 @@ func createWshEventDataRequestProto(reqID int64, wshEventData *WshEventData) *pr
 		wshEventDataRequestProto.EndDate = &wshEventData.EndDate
 	}
 
-	if isValidInt64Value(int64(wshEventData.TotalLimit)) {
+	if isValidInt64Value(wshEventData.TotalLimit) {
 		total := int32(wshEventData.TotalLimit)
 		wshEventDataRequestProto.TotalLimit = &total
 	}
@@ -1743,32 +1746,6 @@ func createScannerSubscriptionProto(subscription *ScannerSubscription, scannerSu
 		proto.ScannerSubscriptionFilterOptions = filt
 	}
 	return proto
-}
-
-func createFundamentalsDataRequestProto(reqID int64, contract *Contract, reportType string, fundamentalsDataOptionsList []TagValue) *protobuf.FundamentalsDataRequest {
-	req := &protobuf.FundamentalsDataRequest{}
-	if isValidInt64Value(reqID) {
-		id := int32(reqID)
-		req.ReqId = &id
-	}
-	req.Contract = createContractProto(contract, &Order{})
-	if !stringIsEmpty(reportType) {
-		req.ReportType = &reportType
-	}
-	opts := createStringStringMap(fundamentalsDataOptionsList)
-	if len(opts) > 0 {
-		req.FundamentalsDataOptions = opts
-	}
-	return req
-}
-
-func createCancelFundamentalsDataProto(reqID int64) *protobuf.CancelFundamentalsData {
-	cancel := &protobuf.CancelFundamentalsData{}
-	if isValidInt64Value(reqID) {
-		id := int32(reqID)
-		cancel.ReqId = &id
-	}
-	return cancel
 }
 
 func createPnLRequestProto(reqID int64, account, modelCode string) *protobuf.PnLRequest {

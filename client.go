@@ -109,20 +109,6 @@ func (me *MsgEncoder) encodeFields(v ...any) *MsgEncoder {
 	return me
 }
 
-// encodeMax encodes a value that might be UNSET
-func (me *MsgEncoder) encodeMax(v any) *MsgEncoder {
-	switch val := v.(type) {
-	case int64:
-		return me.encodeIntMax(val)
-	case float64:
-		return me.encodeFloatMax(val)
-	// case Decimal:
-	// 	return me.encodeDecimalMax(val)
-	default:
-		return me.encodeField(v)
-	}
-}
-
 // encodeInt adds an int value to the message
 func (me *MsgEncoder) encodeInt(v int) *MsgEncoder {
 	me.buf.WriteString(strconv.Itoa(v))
@@ -178,6 +164,8 @@ func (me *MsgEncoder) encodeBytes(v []byte) *MsgEncoder {
 }
 
 // encodeBytes adds raw bytes to the message
+//
+//nolint:unparam // returns *MsgEncoder for chaining, consistent with every other encode* method
 func (me *MsgEncoder) encodeProto(v []byte) *MsgEncoder {
 	me.buf.Write(v)
 	return me
@@ -191,6 +179,8 @@ func (me *MsgEncoder) encodeDecimal(v Decimal) *MsgEncoder {
 }
 
 // encodeTagValues adds a slice of TagValue to the message
+//
+//nolint:unparam // returns *MsgEncoder for chaining, consistent with every other encode* method
 func (me *MsgEncoder) encodeTagValues(v []TagValue) *MsgEncoder {
 	for _, tv := range v {
 		me.buf.WriteString(tv.Tag)
@@ -202,6 +192,9 @@ func (me *MsgEncoder) encodeTagValues(v []TagValue) *MsgEncoder {
 	return me
 }
 
+// encodeContract adds a Contract's fields to the message.
+//
+//nolint:unparam // returns *MsgEncoder for chaining, consistent with every other encode* method
 func (me *MsgEncoder) encodeContract(v *Contract) *MsgEncoder {
 	me.encodeInt64(v.ConID)
 	me.encodeString(v.Symbol)
@@ -220,6 +213,8 @@ func (me *MsgEncoder) encodeContract(v *Contract) *MsgEncoder {
 }
 
 // encodeIntMax adds an int64 value to the message, handling UNSET_INT
+//
+//nolint:unparam // returns *MsgEncoder for chaining, consistent with every other encode* method
 func (me *MsgEncoder) encodeIntMax(v int64) *MsgEncoder {
 	if v == UNSET_INT {
 		me.buf.WriteByte(delim)
@@ -229,6 +224,8 @@ func (me *MsgEncoder) encodeIntMax(v int64) *MsgEncoder {
 }
 
 // encodeFloatMax adds a float64 value to the message, handling UNSET_FLOAT
+//
+//nolint:unparam // returns *MsgEncoder for chaining, consistent with every other encode* method
 func (me *MsgEncoder) encodeFloatMax(v float64) *MsgEncoder {
 	if v == UNSET_FLOAT {
 		me.buf.WriteByte(delim)
@@ -425,7 +422,7 @@ func (c *EClient) validateInvalidSymbols(host string) error {
 }
 
 func (c *EClient) useProtoBuf(msgID int64) bool {
-	if version, exists := PROTOBUF_MSG_IDS[OUT(msgID)]; exists {
+	if version, exists := PROTOBUF_MSG_IDS[msgID]; exists {
 		return version <= c.serverVersion
 	}
 	return false
@@ -541,6 +538,22 @@ func (c *EClient) Connect(host string, port int, clientID int64) error {
 		return CONNECT_FAIL
 	}
 
+	// From here on the socket is live: any early return below must tear it
+	// down and reset internal state the same way Disconnect() does, otherwise
+	// the socket and any goroutines started below are leaked and can interfere
+	// with a subsequent Connect() (e.g. a stale reader canceling the new ctx).
+	connected := false
+	defer func() {
+		if !connected {
+			c.cancel()
+			if err := c.conn.disconnect(); err != nil {
+				log.Error().Err(err).Msg("error disconnecting after failed Connect")
+			}
+			c.wg.Wait()
+			c.reset()
+		}
+	}()
+
 	// HandShake with the TWS or GateWay to ensure the version,
 	log.Debug().Msg("Handshake with TWS or GateWay")
 
@@ -581,7 +594,7 @@ func (c *EClient) Connect(host string, port int, clientID int64) error {
 	msgBytes := c.scanner.Bytes()
 	serverInfo := splitMsgBytes(msgBytes)
 	v, _ := strconv.Atoi(string(serverInfo[0]))
-	c.serverVersion = Version(v)
+	c.serverVersion = v
 	if c.serverVersion < MIN_SERVER_VER_SUPPORTED {
 		c.wrapper.Error(NO_VALID_ID, currentTimeMillis(), UNSUPPORTED_VERSION.Code, UNSUPPORTED_VERSION.Msg, "")
 		return UNSUPPORTED_VERSION
@@ -606,6 +619,7 @@ func (c *EClient) Connect(host string, port int, clientID int64) error {
 
 	c.setConnState(CONNECTED)
 	c.wrapper.ConnectAck()
+	connected = true
 
 	// 4) Launch the shutdown watcher exactly once
 	c.watchOnce.Do(func() {
@@ -800,7 +814,9 @@ func (c *EClient) ConnectWithGracefulShutdown(host string, port int, clientID in
 	go func() {
 		<-sigChan
 		log.Warn().Msg("detected termination signal, shutting down gracefully")
-		c.Disconnect()
+		if err := c.Disconnect(); err != nil {
+			log.Error().Err(err).Msg("error disconnecting on termination signal")
+		}
 		os.Exit(0)
 	}()
 	return nil
@@ -815,7 +831,7 @@ func (c *EClient) Disconnect() error {
 		return nil
 	}
 
-	// Set Disconnected state realy so that new calls to Disconnect() will not block
+	// Set Disconnected state early so that new calls to Disconnect() will not block
 	c.setConnState(DISCONNECTED)
 
 	// 1) Cancel to unblock request Loop
@@ -2160,7 +2176,7 @@ func (c *EClient) PlaceOrder(orderID int64, contract *Contract, order *Order) {
 	if c.serverVersion >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
 		me.encodeDecimal(order.TotalQuantity)
 	} else {
-		me.encodeDecimal(order.TotalQuantity)
+		me.encodeInt64(order.TotalQuantity.Int())
 	}
 
 	me.encodeString(order.OrderType)
@@ -2639,6 +2655,12 @@ func (c *EClient) validateOrderParameters(order *protobuf.Order) string {
 	if c.serverVersion < MIN_SERVER_VER_HEDGE_MAX_SIZE {
 		if order.HedgeMaxSize != nil {
 			return "hedgeMaxSize"
+		}
+	}
+
+	if c.serverVersion < UNIFIED_VERSION_COND_ORDER_WITH_OVERNIGHT_PARAM {
+		if order.ConditionsIncludeOvernight != nil {
+			return "conditionsIncludeOvernight"
 		}
 	}
 	return ""
@@ -5276,160 +5298,6 @@ func (c *EClient) cancelRealTimeBarsProtoBuf(cancelRealTimeBarsProto *protobuf.C
 	me.encodeMsgID(CANCEL_REAL_TIME_BARS + PROTOBUF_MSG_ID)
 
 	msg, err := proto.Marshal(cancelRealTimeBarsProto)
-	if err != nil {
-		c.wrapper.Error(reqID, currentTimeMillis(), ERROR_ENCODING_PROTOBUF.Code, ERROR_ENCODING_PROTOBUF.Msg+err.Error(), "")
-		return
-	}
-
-	me.encodeProto(msg)
-
-	c.enqueue(reqID, me.Bytes())
-}
-
-//	##########################################################################
-//	#		Fundamental Data
-// 	##########################################################################
-
-// ReqFundamentalData requests fundamental data for stocks.
-// The appropriate market data subscription must be set up in Account Management before you can receive this data.
-// Result will be delivered via wrapper.FundamentalData().
-// this func can handle conid specified in the Contract object, but not tradingClass or multiplier.
-// This is because this func is used only for stocks and stocks do not have a multiplier and trading class.
-// reqId is	the ID of the data request. Ensures that responses are matched to requests if several requests are in process.
-// contract contains a description of the contract for which fundamental data is being requested.
-// reportType is one of the following XML reports:
-//
-//	ReportSnapshot (company overview)
-//	ReportsFinSummary (financial summary)
-//	ReportRatios (financial ratios)
-//	ReportsFinStatements (financial statements)
-//	RESC (analyst estimates)
-//	CalendarReport (company calendar)
-func (c *EClient) ReqFundamentalData(reqID int64, contract *Contract, reportType string, fundamentalDataOptions []TagValue) {
-
-	if c.useProtoBuf(REQ_FUNDAMENTAL_DATA) {
-		c.reqFundamentalsDataProtoBuf(createFundamentalsDataRequestProto(reqID, contract, reportType, fundamentalDataOptions))
-		return
-	}
-
-	if !c.IsConnected() {
-		c.wrapper.Error(reqID, currentTimeMillis(), NOT_CONNECTED.Code, NOT_CONNECTED.Msg, "")
-		return
-	}
-
-	if c.serverVersion < MIN_SERVER_VER_FUNDAMENTAL_DATA {
-		c.wrapper.Error(reqID, currentTimeMillis(), UPDATE_TWS.Code, UPDATE_TWS.Msg+"  It does not support fundamental data request.", "")
-		return
-	}
-
-	if c.serverVersion < MIN_SERVER_VER_TRADING_CLASS {
-		c.wrapper.Error(reqID, currentTimeMillis(), UPDATE_TWS.Code, UPDATE_TWS.Msg+"  It does not support conId parameter in reqFundamentalData.", "")
-		return
-	}
-
-	const VERSION = 2
-
-	me := NewMsgEncoder(12, c)
-
-	me.encodeMsgID(REQ_FUNDAMENTAL_DATA)
-
-	me.encodeInt(VERSION)
-	me.encodeInt64(reqID)
-
-	if c.serverVersion >= MIN_SERVER_VER_TRADING_CLASS {
-		me.encodeInt64(contract.ConID)
-	}
-
-	me.encodeString(contract.Symbol)
-	me.encodeString(contract.SecType)
-	me.encodeString(contract.Exchange)
-	me.encodeString(contract.PrimaryExchange)
-	me.encodeString(contract.Currency)
-	me.encodeString(contract.LocalSymbol)
-
-	me.encodeString(reportType)
-
-	if c.serverVersion >= MIN_SERVER_VER_LINKING {
-		me.encodeTagValues(fundamentalDataOptions)
-	}
-
-	c.enqueue(reqID, me.Bytes())
-}
-
-func (c *EClient) reqFundamentalsDataProtoBuf(fundamentalsDataRequestProto *protobuf.FundamentalsDataRequest) {
-
-	reqID := NO_VALID_ID
-	if fundamentalsDataRequestProto.ReqId != nil {
-		reqID = int64(*fundamentalsDataRequestProto.ReqId)
-	}
-
-	if !c.IsConnected() {
-		c.wrapper.Error(reqID, currentTimeMillis(), NOT_CONNECTED.Code, NOT_CONNECTED.Msg, "")
-		return
-	}
-
-	me := NewMsgEncoder(12, c)
-
-	me.encodeMsgID(REQ_FUNDAMENTAL_DATA + PROTOBUF_MSG_ID)
-
-	msg, err := proto.Marshal(fundamentalsDataRequestProto)
-	if err != nil {
-		c.wrapper.Error(reqID, currentTimeMillis(), ERROR_ENCODING_PROTOBUF.Code, ERROR_ENCODING_PROTOBUF.Msg+err.Error(), "")
-		return
-	}
-
-	me.encodeProto(msg)
-
-	c.enqueue(reqID, me.Bytes())
-}
-
-// CancelFundamentalData cancels fundamental data.
-func (c *EClient) CancelFundamentalData(reqID int64) {
-
-	if c.useProtoBuf(CANCEL_FUNDAMENTAL_DATA) {
-		c.cancelFundamentalsDataProtoBuf(createCancelFundamentalsDataProto(reqID))
-		return
-	}
-
-	if !c.IsConnected() {
-		c.wrapper.Error(reqID, currentTimeMillis(), NOT_CONNECTED.Code, NOT_CONNECTED.Msg, "")
-		return
-	}
-
-	if c.serverVersion < MIN_SERVER_VER_FUNDAMENTAL_DATA {
-		c.wrapper.Error(reqID, currentTimeMillis(), UPDATE_TWS.Code, UPDATE_TWS.Msg+" It does not support fundamental data request.", "")
-		return
-	}
-
-	const VERSION = 1
-
-	me := NewMsgEncoder(3, c)
-
-	me.encodeMsgID(CANCEL_FUNDAMENTAL_DATA)
-	me.encodeInt(VERSION)
-	me.encodeInt64(reqID)
-
-	c.enqueue(reqID, me.Bytes())
-
-}
-
-func (c *EClient) cancelFundamentalsDataProtoBuf(cancelFundamentalsDataProto *protobuf.CancelFundamentalsData) {
-
-	reqID := NO_VALID_ID
-	if cancelFundamentalsDataProto.ReqId != nil {
-		reqID = int64(*cancelFundamentalsDataProto.ReqId)
-	}
-
-	if !c.IsConnected() {
-		c.wrapper.Error(reqID, currentTimeMillis(), NOT_CONNECTED.Code, NOT_CONNECTED.Msg, "")
-		return
-	}
-
-	me := NewMsgEncoder(3, c)
-
-	me.encodeMsgID(CANCEL_FUNDAMENTAL_DATA + PROTOBUF_MSG_ID)
-
-	msg, err := proto.Marshal(cancelFundamentalsDataProto)
 	if err != nil {
 		c.wrapper.Error(reqID, currentTimeMillis(), ERROR_ENCODING_PROTOBUF.Code, ERROR_ENCODING_PROTOBUF.Msg+err.Error(), "")
 		return

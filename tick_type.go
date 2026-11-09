@@ -51,7 +51,7 @@ const (
 	CLOSE_EFP_COMPUTATION
 	LAST_TIMESTAMP
 	SHORTABLE
-	FUNDAMENTAL_RATIOS
+	_ // FUNDAMENTAL_RATIOS was removed in API after v0.10.46
 	RT_VOLUME
 	HALTED
 	BID_YIELD
@@ -170,7 +170,7 @@ var tickTypeMap = map[TickType]string{
 	CLOSE_EFP_COMPUTATION:     "CLOSE_EFP_COMPUTATION",
 	LAST_TIMESTAMP:            "LAST_TIMESTAMP",
 	SHORTABLE:                 "SHORTABLE",
-	FUNDAMENTAL_RATIOS:        "FUNDAMENTAL_RATIOS",
+	// FUNDAMENTAL_RATIOS:        "FUNDAMENTAL_RATIOS",
 	RT_VOLUME:                 "RT_VOLUME",
 	HALTED:                    "HALTED",
 	BID_YIELD:                 "BID_YIELD",
@@ -228,6 +228,12 @@ var tickTypeMap = map[TickType]string{
 	FINAL_IPO_LAST:            "FINAL_IPO_LAST",
 	DELAYED_YIELD_BID:         "DELAYED_YIELD_BID",
 	DELAYED_YIELD_ASK:         "DELAYED_YIELD_ASK",
+	ODD_LOT_BID:               "ODD_LOT_BID",
+	ODD_LOT_ASK:               "ODD_LOT_ASK",
+	ODD_LOT_BID_SIZE:          "ODD_LOT_BID_SIZE",
+	ODD_LOT_ASK_SIZE:          "ODD_LOT_ASK_SIZE",
+	ODD_LOT_BID_EXCH:          "ODD_LOT_BID_EXCH",
+	ODD_LOT_ASK_EXCH:          "ODD_LOT_ASK_EXCH",
 	NOT_SET:                   "NOT_SET",
 }
 

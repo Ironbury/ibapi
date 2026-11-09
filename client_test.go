@@ -318,13 +318,6 @@ func TestMarketScanners(t *testing.T) {
 	ib.CancelScannerSubscription(7002)
 }
 
-func TestFundamentals(t *testing.T) {
-	ib := setupIBClient(t)
-	ib.ReqFundamentalData(8001, USStock(), "ReportsFinSummary", nil)
-	time.Sleep(2 * time.Second)
-	ib.CancelFundamentalData(8001)
-}
-
 func TestBulletins(t *testing.T) {
 	ib := setupIBClient(t)
 	ib.ReqNewsBulletins(true)
@@ -530,7 +523,7 @@ func TestHedgeSample(t *testing.T) {
 	parent.OrderID = nextID()
 	parent.Transmit = false
 	// Hedge on the currency conversion
-	hedge := MarketFHedge(parent.OrderID, "BUY")
+	hedge := MarketFxHedge(parent.OrderID, "BUY")
 	// Place the parent first...
 	ib.PlaceOrder(parent.OrderID, EuropeanStock(), parent)
 	// Then the hedge order
@@ -550,8 +543,11 @@ func TestAlgoSamples(t *testing.T) {
 	// accumulate/distribute - The Time Zone in "startTime" and "endTime" attributes is ignored and always defaulted to GMT
 	FillAccumulateDistributeParams(baseOrder, 10, 60, true, true, 1, true, true, "12:00:00", "16:00:00")
 	ib.PlaceOrder(nextID(), USStockAtSmart(), baseOrder)
+	// accudistr
+	FillAccuDistrParams(baseOrder, 5, "MKT", 100, "10:00:00", "11:00:00", "EST")
+	ib.PlaceOrder(nextID(), USStockAtSmart(), baseOrder)
 	// twap
-	FillTwapParams(baseOrder, "Marketable", "09:00:00 US/Eastern", "16:00:00 US/Eastern", true)
+	FillTwapParams(baseOrder, "09:00:00 US/Eastern", "16:00:00 US/Eastern", true)
 	ib.PlaceOrder(nextID(), USStockAtSmart(), baseOrder)
 	// vwap
 	FillVwapParams(baseOrder, 0.2, "09:00:00 US/Eastern", "16:00:00 US/Eastern", true, true, true)
@@ -580,12 +576,6 @@ func TestAlgoSamples(t *testing.T) {
 	// time variant percentage of volume
 	FillTimeVariantPctVolParams(baseOrder, 0.2, 0.4, "12:00:00 US/Eastern", "14:00:00 US/Eastern", true)
 	ib.PlaceOrder(nextID(), USStockAtSmart(), baseOrder)
-	// Jefferies vwap
-	FillJefferiesVWAPParams(baseOrder, "10:00:00 US/Eastern", "16:00:00 US/Eastern", 10, 10, "Exclude_Both", 130, 135, 1, 10, "Patience", false, "Midpoint")
-	ib.PlaceOrder(nextID(), JefferiesContract(), baseOrder)
-	// CSFB Inline
-	FillCSFBInlineParams(baseOrder, "10:00:00 US/Eastern", "16:00:00 US/Eastern", "Patient", 10, 20, 100, "Default", false, 40, 100, 100, 35)
-	ib.PlaceOrder(nextID(), CSFBContract(), baseOrder)
 }
 
 func TestFinancialAdvisorOrderSamples(t *testing.T) {
